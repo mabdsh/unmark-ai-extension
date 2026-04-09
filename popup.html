@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Gemini Watermark Remover</title>
+  <title>UnmarkAI</title>
   <link rel="stylesheet" href="popup.css"/>
 </head>
 <body>
@@ -12,20 +12,25 @@
   <header class="header">
     <div class="logo">
       <svg class="logo-icon" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <polygon points="18,2 32,10 32,26 18,34 4,26 4,10" fill="url(#g1)" opacity="0.14" stroke="url(#g1)" stroke-width="1.5"/>
-        <line x1="18" y1="10" x2="18" y2="26" stroke="url(#g1)" stroke-width="2.2" stroke-linecap="round"/>
-        <line x1="10" y1="18" x2="26" y2="18" stroke="url(#g1)" stroke-width="2.2" stroke-linecap="round"/>
-        <line x1="12" y1="12" x2="24" y2="24" stroke="url(#g1)" stroke-width="1.6" stroke-linecap="round" opacity="0.55"/>
-        <line x1="24" y1="12" x2="12" y2="24" stroke="url(#g1)" stroke-width="1.6" stroke-linecap="round" opacity="0.55"/>
+        <circle cx="18" cy="18" r="15" fill="url(#bg)" opacity="0.12"/>
+        <circle cx="18" cy="18" r="15" stroke="url(#g1)" stroke-width="1.2" opacity="0.5"/>
+        <!-- Sparkle / ✦ shape -->
+        <path d="M18 7 L19.2 16.8 L28 18 L19.2 19.2 L18 29 L16.8 19.2 L8 18 L16.8 16.8 Z"
+              fill="url(#g1)" opacity="0.9"/>
+        <circle cx="18" cy="18" r="2" fill="#fff" opacity="0.6"/>
         <defs>
-          <linearGradient id="g1" x1="4" y1="2" x2="32" y2="34" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#A78BFA"/>
+          <linearGradient id="g1" x1="8" y1="7" x2="28" y2="29" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#C4B5FD"/>
             <stop offset="100%" stop-color="#6366F1"/>
           </linearGradient>
+          <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#8B5CF6"/>
+            <stop offset="100%" stop-color="#6366F1" stop-opacity="0"/>
+          </radialGradient>
         </defs>
       </svg>
       <div class="logo-text">
-        <span class="logo-title">Watermark Remover</span>
+        <span class="logo-title">UnmarkAI</span>
         <span class="logo-sub">Gemini &amp; AI Studio · v3.2</span>
       </div>
     </div>
@@ -57,10 +62,10 @@
   <!-- ── Manual Scan ── -->
   <section class="section scan-section">
     <div class="section-header">
-      <div class="section-title">Manual — Scan Page Images</div>
-      <button class="scan-btn" id="scanBtn">Scan</button>
+      <div class="section-title">Manual Scan</div>
+      <button class="scan-btn" id="scanBtn">Scan Page</button>
     </div>
-    <div class="scan-hint" id="scanHint">Click "Scan" to find images on the current Gemini page</div>
+    <div class="scan-hint" id="scanHint">Click "Scan Page" to find images on the current Gemini page</div>
     <div class="image-grid" id="imageGrid" style="display:none;"></div>
   </section>
 
@@ -70,7 +75,7 @@
     <label class="row-item">
       <div class="row-label">
         <span class="row-name">Remove Visible Watermark</span>
-        <span class="row-desc">Detects and erases "✦ Made with Gemini" mark</span>
+        <span class="row-desc">Detects and erases the ✦ sparkle mark</span>
       </div>
       <label class="toggle sm">
         <input type="checkbox" id="removeVisibleCheckbox"/>
@@ -106,12 +111,12 @@
       <button class="method-btn" data-method="crop">
         <span class="method-icon">✂</span>
         <span class="method-name">Crop</span>
-        <span class="method-desc">Trim image bottom</span>
+        <span class="method-desc">Trim image bottom 8%</span>
       </button>
       <button class="method-btn" data-method="strip">
         <span class="method-icon">⟳</span>
         <span class="method-name">Re-encode</span>
-        <span class="method-desc">SynthID only</span>
+        <span class="method-desc">SynthID strip only</span>
       </button>
     </div>
   </section>
@@ -126,7 +131,7 @@
       </label>
       <label class="format-opt">
         <input type="radio" name="format" value="jpeg" id="formatJpeg"/>
-        <span class="format-label">JPEG <em>Smaller</em></span>
+        <span class="format-label">JPEG <em>Smaller file</em></span>
       </label>
     </div>
   </section>
@@ -148,7 +153,7 @@
   <!-- ── Footer ── -->
   <footer class="footer">
     <button class="reset-btn" id="resetBtn">Reset Stats</button>
-    <span class="version">v3.2.0</span>
+    <span class="version">UnmarkAI v3.2.0</span>
   </footer>
 
   <script src="popup.js"></script>

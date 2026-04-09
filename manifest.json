@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Gemini Watermark Remover",
+  "name": "UnmarkAI",
   "version": "3.2.0",
-  "description": "Removes watermarks from Gemini & AI Studio downloaded images.",
+  "description": "Instantly removes watermarks from Gemini & AI Studio generated images. Strips both the visible sparkle mark and invisible SynthID fingerprint.",
   "permissions": [
     "storage",
     "scripting",
@@ -46,7 +46,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Gemini Watermark Remover",
+    "default_title": "UnmarkAI — Watermark Remover",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
