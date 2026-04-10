@@ -1,5 +1,5 @@
 /**
- * UnmarkAI v3.2 — MAIN WORLD Script
+ * UnmarkAI v3.3 — MAIN WORLD Script
  *
  * WHY THIS FILE EXISTS:
  *   Chrome content scripts run in an "isolated world" — a sandboxed JS context.
@@ -16,12 +16,38 @@
  *   All communication with the isolated world happens via window.postMessage.
  *
  * FLOW:
- *   1. Gemini clicks download → Angular creates blob → URL.createObjectURL
- *   2. Angular creates <a download> and calls .click() → intercepted here
- *   3. Post GWR_INTERCEPT to isolated world (content.js)
- *   4. content.js fetches, processes, creates clean data URL
+ *   1. Gemini clicks download → Angular creates blob OR uses direct image URL
+ *   2. Angular creates <a> (with OR without download attr) and calls .click()
+ *   3. We intercept → Post GWR_BLOB + GWR_INTERCEPT to isolated world (content.js)
+ *   4. content.js uses cached Blob directly OR fetches the URL
  *   5. content.js posts GWR_DOWNLOAD back
  *   6. We create <a> with clean data URL and trigger real browser download
+ *
+ * CHANGES v3.3 → v3.4 (direct-download fix):
+ *   ROOT CAUSE FIX: All three intercept methods (.click, dispatchEvent,
+ *   MutationObserver) previously required hasAttribute('download'). Gemini's
+ *   Angular download handler creates <a href="..."> WITHOUT a download attribute
+ *   and calls .click() — so all three guards fired 'pass-through' and the
+ *   original watermarked download proceeded unchecked.
+ *   → Removed the download-attribute gate from all intercept paths.
+ *   → Added guessFilename(url) so we always produce a sensible filename even
+ *     when Gemini doesn't supply one via the download attribute.
+ *
+ * CHANGES v3.4 → v3.5 (blob:null fix):
+ *   CHROME SECURITY ISSUE: Gemini creates image blobs inside a sandboxed
+ *   iframe (null origin). These produce blob:null/uuid URLs that content.js
+ *   (isolated world) CANNOT fetch — Chrome blocks it with
+ *   "URL scheme blob is not supported" regardless of host_permissions.
+ *   TWO-PART FIX:
+ *   1. sendIntercept is now async. When a blob IS in our blobMap (main-frame
+ *      blobs we captured), we use FileReader to convert it to a data URL HERE
+ *      in the main world and pass that data URL via GWR_BLOB. Content.js then
+ *      does fetch(dataUrl) which always works — no blob: scheme needed.
+ *   2. When the blob is NOT in blobMap (sandboxed iframe blobs we can't
+ *      capture), we walk the DOM for a nearby <img src> pointing to the same
+ *      image via an accessible HTTPS URL, and pass that as imgHint in
+ *      GWR_INTERCEPT. Content.js uses it as the authoritative fallback URL.
+ *   Both paths ensure content.js never tries to fetch a blob:null URL.
  */
 
 (function () {
@@ -72,8 +98,11 @@
   };
 
   // ── Override: programmatic .click() on anchor elements ──────────────────
+  // ROOT CAUSE FIX v3.4: removed `!this.hasAttribute('download')` guard.
+  // Gemini creates plain <a href="..."> without a download attribute, which
+  // caused all three interception paths to silently pass through before.
   HTMLAnchorElement.prototype.click = function () {
-    if (this._uaiDone || !enabled || !this.hasAttribute('download')) {
+    if (this._uaiDone || !enabled) {
       return _origClick.apply(this, arguments);
     }
     const href = this.href;
@@ -81,11 +110,13 @@
       return _origClick.apply(this, arguments);
     }
     log('Intercepted .click() on', href.slice(0, 70));
-    sendIntercept(href, this.getAttribute('download') || 'gemini-image.png');
+    // Use download attr if present, otherwise guess from URL
+    sendIntercept(href, this.getAttribute('download') || guessFilename(href));
     // Do NOT call _origClick — we handle the download ourselves
   };
 
   // ── Override: dispatchEvent (catches React/Angular synthetic clicks) ─────
+  // ROOT CAUSE FIX v3.4: removed `this.hasAttribute('download')` guard.
   EventTarget.prototype.dispatchEvent = function (event) {
     if (
       enabled &&
@@ -93,25 +124,24 @@
       this instanceof HTMLAnchorElement &&
       event instanceof MouseEvent &&
       event.type === 'click' &&
-      this.hasAttribute('download') &&
       looksLikeGeminiImage(this.href)
     ) {
       log('Intercepted dispatchEvent click on', this.href.slice(0, 70));
-      sendIntercept(this.href, this.getAttribute('download') || 'gemini-image.png');
+      sendIntercept(this.href, this.getAttribute('download') || guessFilename(this.href));
       return true; // pretend event fired normally
     }
     return _origDispatch.apply(this, arguments);
   };
 
   // ── MutationObserver: catch "append → click → remove" anchor pattern ─────
-  // Angular/React often creates a temporary <a> in the DOM, clicks it
-  // programmatically, then removes it. We capture-listen before that click fires.
+  // Angular often creates a temporary <a> in the DOM, clicks it, then removes it.
+  // ROOT CAUSE FIX v3.4: removed `!node.hasAttribute('download')` guard.
   new MutationObserver((mutations) => {
     if (!enabled) return;
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (!(node instanceof HTMLAnchorElement)) continue;
-        if (!node.hasAttribute('download') || node._uaiDone) continue;
+        if (node._uaiDone) continue;
         if (!looksLikeGeminiImage(node.href)) continue;
 
         node.addEventListener('click', function captureHandler(e) {
@@ -119,7 +149,7 @@
           e.stopImmediatePropagation();
           node.removeEventListener('click', captureHandler, true);
           log('Intercepted MutationObserver click on', node.href.slice(0, 70));
-          sendIntercept(node.href, node.getAttribute('download') || 'gemini-image.png');
+          sendIntercept(node.href, node.getAttribute('download') || guessFilename(node.href));
         }, true /* capture phase — fires before Angular handlers */);
       }
     }
@@ -127,18 +157,73 @@
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
-  function sendIntercept(url, filename) {
+  // v3.5 FIX: sendIntercept is now async.
+  //
+  // For blobs we captured via our URL.createObjectURL override (main-frame blobs):
+  //   FileReader converts them to a data URL HERE in the main world, then sends
+  //   GWR_BLOB(dataUrl). Content.js receives a plain string it can fetch() directly
+  //   — no blob: scheme needed, no Chrome security restriction.
+  //
+  // For blob:null blobs (sandboxed iframe — we never captured them):
+  //   We walk the DOM for a large <img> pointing to the same image via an HTTPS URL
+  //   and pass it as imgHint. Content.js uses this as the authoritative fallback.
+  async function sendIntercept(url, filename) {
+    const blob = blobMap.get(url);
+
+    if (blob) {
+      // Convert to data URL inside the main world — content.js can always fetch these
+      try {
+        const dataUrl = await blobToDataUrl(blob);
+        window.postMessage({ gwrType: 'GWR_BLOB', url, dataUrl }, '*');
+      } catch (e) {
+        log('blobToDataUrl failed:', e.message);
+      }
+    }
+
+    // Always look for a nearby HTTPS image URL as a fallback for blob:null downloads
+    const imgHint = findNearestGeminiImageUrl();
+
     window.postMessage({
       gwrType:  'GWR_INTERCEPT',
       url,
       filename,
-      hasBlob:  blobMap.has(url),
+      hasBlob:  !!blob,
+      imgHint,  // may be null if no accessible image found
     }, '*');
-    // Transfer blob separately if available (Blob is structured-cloneable)
-    const blob = blobMap.get(url);
-    if (blob) {
-      window.postMessage({ gwrType: 'GWR_BLOB', url, blob }, '*');
+  }
+
+  // Convert a Blob to a data URL using FileReader (main-world has full access)
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader   = new FileReader();
+      reader.onload  = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('FileReader failed'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  // Walk the DOM for large Gemini-hosted images — same URL patterns as
+  // __UAI_scanImages so imgHint always matches what manual scan can find.
+  function findNearestGeminiImageUrl() {
+    const imgs = Array.from(document.querySelectorAll('img[src]'));
+    for (let i = imgs.length - 1; i >= 0; i--) {
+      const img = imgs[i];
+      if (img.naturalWidth < 256 || img.naturalHeight < 256) continue;
+      const { src } = img;
+      if (src.startsWith('blob:')) continue; // skip inaccessible blobs
+      if (
+        src.includes('googleusercontent.com') ||
+        src.includes('generativelanguage.googleapis.com') ||
+        src.includes('storage.googleapis.com') ||
+        src.includes('generatedimage')
+      ) return src;
+      // Broad fallback: any URL with a recognised image extension
+      try {
+        const path = new URL(src).pathname;
+        if (/\.(png|jpe?g|webp)(\?|$)/i.test(path)) return src;
+      } catch {}
     }
+    return null;
   }
 
   function doDownload(urlOrData, filename) {
@@ -151,10 +236,6 @@
     setTimeout(() => { try { document.body.removeChild(a); } catch {} }, 2000);
   }
 
-  /**
-   * Returns true only for URLs that look like Gemini-generated images.
-   * Deliberately narrow to avoid intercepting unrelated downloads.
-   */
   function looksLikeGeminiImage(url) {
     if (!url) return false;
 
@@ -180,9 +261,26 @@
     return false;
   }
 
+  /**
+   * Produces a reasonable download filename when the <a> element has no
+   * download attribute. Extracts the last path segment and appends .png
+   * if it has no recognised image extension.
+   */
+  function guessFilename(url) {
+    try {
+      if (url.startsWith('blob:') || url.startsWith('data:')) {
+        return 'gemini-image.png';
+      }
+      const seg = new URL(url).pathname.split('/').filter(Boolean).pop() || 'gemini-image';
+      return /\.(png|jpe?g|jpg|webp|gif|avif)$/i.test(seg) ? seg : seg + '.png';
+    } catch {
+      return 'gemini-image.png';
+    }
+  }
+
   function log(...args) {
     console.log('%c' + TAG, 'color:#8B5CF6;font-weight:700', ...args);
   }
 
-  log('MAIN world interceptors installed ✦');
+  log('MAIN world interceptors installed ✦ v3.4');
 })();

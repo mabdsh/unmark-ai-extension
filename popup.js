@@ -1,5 +1,14 @@
 /**
- * UnmarkAI v3.2 — Popup Script
+ * UnmarkAI v3.3 — Popup Script
+ *
+ * CHANGES v3.2 → v3.3:
+ *   • BUG FIX: Removed duplicate chrome.runtime.sendMessage({ action: 'getSession' })
+ *     call that existed both in boot() and at module level — caused a race condition
+ *     where the second response could overwrite a more recent count from storage.
+ *   • FEATURE: "Download All" button — batch-processes every Gemini image on the page.
+ *   • FEATURE: JPEG quality slider (50–99) stored in settings.
+ *   • IMPROVEMENT: storage.sync.set errors are now caught and logged silently.
+ *   • IMPROVEMENT: "Scan Page" auto-refreshes count after a successful Download All.
  */
 'use strict';
 
@@ -17,8 +26,11 @@ const statSession     = $('statSession');
 const methodBtns      = document.querySelectorAll('.method-btn');
 const formatPng       = $('formatPng');
 const formatJpeg      = $('formatJpeg');
+const qualitySlider   = $('qualitySlider');
+const qualityValue    = $('qualityValue');
 const resetBtn        = $('resetBtn');
 const scanBtn         = $('scanBtn');
+const dlAllBtn        = $('dlAllBtn');
 const imageGrid       = $('imageGrid');
 const scanHint        = $('scanHint');
 
@@ -28,11 +40,13 @@ let cfg = {
   removeSynthID:     true,
   method:            'smart',
   format:            'png',
+  jpegQuality:       0.96,
   showNotifications: true,
 };
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 async function boot() {
+  // BUG FIX v3.3: getSession is fetched ONLY here, not again at module level
   const [stored, statsData, sessionData] = await Promise.all([
     chrome.storage.sync.get('settings'),
     chrome.storage.sync.get('stats'),
@@ -55,6 +69,12 @@ function renderCfg() {
   methodBtns.forEach(b => b.classList.toggle('active', b.dataset.method === cfg.method));
   formatPng.checked  = cfg.format !== 'jpeg';
   formatJpeg.checked = cfg.format === 'jpeg';
+
+  // Quality slider
+  const q = Math.round((cfg.jpegQuality ?? 0.96) * 100);
+  if (qualitySlider) qualitySlider.value = q;
+  if (qualityValue)  qualityValue.textContent = q + '%';
+  updateQualityVisibility();
 }
 
 function renderStats(stats, session) {
@@ -69,8 +89,17 @@ function setStatus(on) {
     : 'Paused — downloads pass through unchanged';
 }
 
+// Show/hide quality slider based on format selection
+function updateQualityVisibility() {
+  const row = $('qualityRow');
+  if (row) row.style.display = cfg.format === 'jpeg' ? '' : 'none';
+}
+
+// ── Save helper ────────────────────────────────────────────────────────────
 function save() {
-  chrome.storage.sync.set({ settings: { ...cfg } });
+  chrome.storage.sync.set({ settings: { ...cfg } }).catch(err => {
+    console.warn('[UAI popup] settings save failed:', err.message);
+  });
 }
 
 // ── Controls ───────────────────────────────────────────────────────────────
@@ -92,8 +121,18 @@ methodBtns.forEach(btn => btn.addEventListener('click', () => {
   save();
 }));
 
-formatPng.addEventListener('change',  () => { cfg.format = 'png';  save(); });
-formatJpeg.addEventListener('change', () => { cfg.format = 'jpeg'; save(); });
+formatPng.addEventListener('change',  () => { cfg.format = 'png';  save(); updateQualityVisibility(); });
+formatJpeg.addEventListener('change', () => { cfg.format = 'jpeg'; save(); updateQualityVisibility(); });
+
+// v3.3: JPEG quality slider
+if (qualitySlider) {
+  qualitySlider.addEventListener('input', () => {
+    const val = parseInt(qualitySlider.value, 10);
+    if (qualityValue) qualityValue.textContent = val + '%';
+    cfg.jpegQuality = val / 100;
+    save();
+  });
+}
 
 resetBtn.addEventListener('click', async () => {
   await chrome.storage.sync.set({ stats: { totalRemoved: 0, lastReset: Date.now() } });
@@ -102,8 +141,6 @@ resetBtn.addEventListener('click', async () => {
 });
 
 // ── Live Updates from storage ──────────────────────────────────────────────
-// Catches increments fired by background.js when a watermark is removed,
-// even while the popup is open — keeps the session counter live.
 chrome.storage.onChanged.addListener((changes) => {
   if (changes.stats?.newValue) {
     const total = changes.stats.newValue.totalRemoved ?? 0;
@@ -112,22 +149,13 @@ chrome.storage.onChanged.addListener((changes) => {
   }
 });
 
-// Poll the background for the session count every time popup opens
-// (session counter lives in memory, not storage)
-chrome.runtime.sendMessage({ action: 'getSession' })
-  .then(({ sessionCount }) => {
-    if (sessionCount != null) {
-      statSession.textContent = sessionCount.toLocaleString();
-    }
-  })
-  .catch(() => {});
-
 // ── Manual Scan ────────────────────────────────────────────────────────────
 scanBtn.addEventListener('click', scanPageImages);
 
 async function scanPageImages() {
   scanBtn.disabled    = true;
   scanBtn.textContent = '…';
+  if (dlAllBtn) { dlAllBtn.style.display = 'none'; }
   imageGrid.style.display = 'none';
   scanHint.textContent    = 'Scanning page for images…';
 
@@ -144,7 +172,6 @@ async function scanPageImages() {
       return;
     }
 
-    // Try the new __UAI_scanImages name, fall back to old __GWR_scanImages
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => {
@@ -161,7 +188,16 @@ async function scanPageImages() {
     }
 
     const s = images.length !== 1 ? 's' : '';
-    scanHint.textContent = `Found ${images.length} image${s} — hover an image and click ↓ Clean`;
+    scanHint.textContent = `Found ${images.length} image${s} — hover to clean individually`;
+
+    // v3.3: show Download All button when multiple images found
+    if (dlAllBtn && images.length > 1) {
+      dlAllBtn.style.display = '';
+      dlAllBtn.textContent   = `↓ Clean All (${images.length})`;
+      dlAllBtn.disabled      = false;
+      dlAllBtn._tabId        = tab.id;
+    }
+
     renderImageGrid(images, tab.id);
     imageGrid.style.display = 'grid';
 
@@ -174,6 +210,47 @@ async function scanPageImages() {
   }
 }
 
+// ── v3.3: Download All ─────────────────────────────────────────────────────
+if (dlAllBtn) {
+  dlAllBtn.addEventListener('click', async () => {
+    dlAllBtn.disabled    = true;
+    dlAllBtn.textContent = 'Processing…';
+
+    const tabId = dlAllBtn._tabId;
+    if (!tabId) { dlAllBtn.textContent = 'Error'; return; }
+
+    try {
+      const execResult = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const fn = window.__UAI_downloadAll;
+          if (typeof fn !== 'function') {
+            return { ok: false, error: 'UnmarkAI not loaded — refresh the Gemini page' };
+          }
+          return fn();
+        },
+      });
+
+      const result = execResult?.[0]?.result;
+      if (result?.ok) {
+        dlAllBtn.textContent = `✓ Done (${result.succeeded}/${result.total})`;
+        const cur = parseInt(statSession.textContent.replace(/,/g, ''), 10) || 0;
+        statSession.textContent = (cur + result.succeeded).toLocaleString();
+        bump(statSession);
+      } else {
+        dlAllBtn.textContent = `✗ Failed`;
+        dlAllBtn.disabled    = false;
+        console.error('[UAI popup] downloadAll failed:', result?.error);
+      }
+    } catch (err) {
+      dlAllBtn.textContent = '✗ Error';
+      dlAllBtn.disabled    = false;
+      console.error('[UAI popup]', err);
+    }
+  });
+}
+
+// ── Image Grid ─────────────────────────────────────────────────────────────
 function renderImageGrid(images, tabId) {
   imageGrid.innerHTML = '';
 
@@ -230,7 +307,6 @@ function renderImageGrid(images, tabId) {
           badge.textContent = '✓';
           card.appendChild(badge);
           dlBtn.textContent = '✓ Done';
-          // Update session counter immediately
           const cur = parseInt(statSession.textContent.replace(/,/g, ''), 10) || 0;
           statSession.textContent = (cur + 1).toLocaleString();
           bump(statSession);
@@ -258,8 +334,7 @@ function renderImageGrid(images, tabId) {
 // ── Utilities ──────────────────────────────────────────────────────────────
 function bump(el) {
   el.classList.remove('bump');
-  // Force reflow so the animation restarts even on rapid increments
-  void el.offsetWidth;
+  void el.offsetWidth; // force reflow so animation restarts
   el.classList.add('bump');
   setTimeout(() => el.classList.remove('bump'), 300);
 }

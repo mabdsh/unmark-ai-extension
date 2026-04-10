@@ -1,20 +1,34 @@
 /**
- * UnmarkAI v3.2 — ISOLATED WORLD Content Script
+ * UnmarkAI v3.3 — ISOLATED WORLD Content Script
  *
  * Has access to Chrome APIs but cannot intercept page JS (that's main-world.js).
  * Communicates with main-world.js via window.postMessage.
  *
  * RESPONSIBILITIES:
  *   • Receive GWR_INTERCEPT messages → fetch image → process → send GWR_DOWNLOAD
- *   • Expose __UAI_scanImages / __UAI_processAndDownload for popup manual scan
+ *   • Cache blobs from GWR_BLOB to avoid re-fetching (prevents revocation issues)
+ *   • Expose __UAI_scanImages / __UAI_processAndDownload / __UAI_downloadAll for popup
  *   • Sync settings to main world on load and on settings change
  *   • Report stats to background service worker
  *
  * METHODS (cfg.method):
- *   smart    — Detect sparkle region, fill with blended surrounding sample (default)
+ *   smart    — Inverse-distance-weighted fill with Gaussian texture noise (default)
  *   fill     — Detect sparkle region, fill by copying pixels from directly above
  *   crop     — Trim the bottom 8 % of the image (removes badge + sparkle entirely)
  *   strip    — Re-encode only; destroys SynthID, no visible-watermark removal
+ *
+ * CHANGES v3.4 → v3.5 (blob:null fix):
+ *   ROOT CAUSE: Gemini creates image blobs in a sandboxed iframe (null origin).
+ *   These produce blob:null/uuid URLs. Chrome BLOCKS fetch() of blob:null URLs
+ *   from isolated-world content scripts with "URL scheme blob is not supported".
+ *   TWO-PART FIX:
+ *   1. GWR_BLOB now accepts a pre-converted dataUrl string (sent by main-world
+ *      via FileReader) instead of a Blob object. fetch(dataUrl) always works.
+ *   2. fetchImage now has a multi-stage fallback chain: cached dataUrl →
+ *      cached Blob → data: URL → blob: URL (try/catch) → HTTPS via background
+ *      → imgHint HTTPS URL passed from main-world → DOM scan for page images.
+ *      The last two stages handle blob:null definitively by using the same
+ *      HTTPS URL that the manual scan uses (which always works).
  */
 
 (function () {
@@ -29,6 +43,7 @@
     removeSynthID:     true,
     method:            'smart',
     format:            'png',
+    jpegQuality:       0.96,   // v3.3 — user-configurable
     showNotifications: true,
   };
 
@@ -61,26 +76,58 @@
   // intercept and the popup manual-download trigger simultaneously).
   const processingUrls = new Set();
 
+  // ── v3.5: Image data cache ─────────────────────────────────────────────────
+  // main-world.js sends GWR_BLOB(dataUrl) before GWR_INTERCEPT.
+  // We store the data URL string here; fetch(dataUrl) always works in content.js
+  // unlike fetch('blob:null/...') which Chrome blocks with a security error.
+  const blobCache = new Map(); // blobUrl → data URL string or Blob
+
   // ── Message Bridge ─────────────────────────────────────────────────────────
   function installMessageBridge() {
     window.addEventListener('message', async (e) => {
       if (!e.data || typeof e.data.gwrType !== 'string') return;
       if (e.origin !== window.location.origin && e.origin !== 'null') return;
 
-      if (e.data.gwrType === 'GWR_INTERCEPT') {
-        if (!cfg.enabled) {
-          window.postMessage({ gwrType: 'GWR_FALLBACK', url: e.data.url, filename: e.data.filename }, '*');
-          return;
+      switch (e.data.gwrType) {
+
+        // v3.5: main-world now sends a pre-converted data URL string (not a Blob)
+        // so content.js never needs to fetch a blob: URL at all.
+        case 'GWR_BLOB': {
+          const { url, dataUrl, blob } = e.data;
+          // Accept either a data URL string (v3.5) or a Blob object (legacy)
+          const cached = (typeof dataUrl === 'string' && dataUrl.startsWith('data:'))
+            ? dataUrl
+            : (blob instanceof Blob ? blob : null);
+          if (url && cached) {
+            blobCache.set(url, cached);
+            setTimeout(() => blobCache.delete(url), 90_000);
+          }
+          break;
         }
-        // Notify background so fallback download.onCreated skips this URL
-        chrome.runtime.sendMessage({ action: 'lockUrl', url: e.data.url }).catch(() => {});
-        await processIntercept(e.data.url, e.data.filename);
+
+        case 'GWR_INTERCEPT': {
+          if (!cfg.enabled) {
+            window.postMessage({ gwrType: 'GWR_FALLBACK', url: e.data.url, filename: e.data.filename }, '*');
+            return;
+          }
+          // Notify background so fallback downloads.onCreated skips this URL
+          chrome.runtime.sendMessage({ action: 'lockUrl', url: e.data.url }).catch(() => {});
+          // v3.5: pass imgHint through so fetchImage can use it for blob:null fallback
+          await processIntercept(
+            e.data.url,
+            e.data.filename,
+            blobCache.get(e.data.url),
+            e.data.imgHint ?? null,
+          );
+          break;
+        }
       }
     });
   }
 
-  async function processIntercept(url, filename) {
-    // Deduplicate: ignore if same URL is already in flight
+  // v3.5: imgHint param — HTTPS URL from a nearby <img> on the page,
+  // used as fallback when the download URL is a blob:null we cannot fetch.
+  async function processIntercept(url, filename, cachedData = null, imgHint = null) {
     if (processingUrls.has(url)) {
       log('Duplicate intercept ignored for:', url.slice(0, 60));
       return;
@@ -89,7 +136,7 @@
 
     toast('Removing watermark…', 'info');
     try {
-      const rawBlob   = await fetchImage(url);
+      const rawBlob   = await fetchImage(url, cachedData, imgHint);
       const cleanBlob = await processImage(rawBlob);
       const dataUrl   = await blobToDataURL(cleanBlob);
 
@@ -108,61 +155,169 @@
       window.postMessage({ gwrType: 'GWR_FALLBACK', url, filename }, '*');
     } finally {
       processingUrls.delete(url);
+      blobCache.delete(url);
     }
   }
 
-  // ── Image Fetch ────────────────────────────────────────────────────────────
-  async function fetchImage(url) {
-    // Blob / data URLs: fetch directly (isolated world can access same-tab blobs)
-    if (url.startsWith('blob:') || url.startsWith('data:')) {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`blob fetch failed: ${r.status}`);
+  // ── Image Fetch — v3.5 multi-stage fallback chain ─────────────────────────
+  //
+  //  Stage 1: cached data URL string (pre-converted by main-world FileReader)
+  //  Stage 2: cached Blob object (legacy GWR_BLOB path)
+  //  Stage 3: data: URL directly in the intercept URL
+  //  Stage 4: blob: URL with KNOWN accessible origin — try fetch()
+  //           blob:null is SKIPPED entirely (Chrome always logs a security
+  //           violation even when caught by try/catch — skipping eliminates
+  //           the error from the extension console completely)
+  //  Stage 5: HTTPS URL — delegate to background service worker
+  //  Stage 6: imgHint (HTTPS URL found by main-world near the anchor element)
+  //  Stage 7: DOM scan — same logic as __UAI_scanImages (always finds images
+  //           that are visible on the Gemini page)
+  async function fetchImage(url, cachedData = null, imgHint = null) {
+
+    // Stage 1: pre-converted data URL from main-world (most reliable path)
+    if (typeof cachedData === 'string' && cachedData.startsWith('data:')) {
+      log('Stage 1: pre-converted data URL from main-world');
+      const r = await fetch(cachedData);
+      if (!r.ok) throw new Error(`data URL fetch failed: ${r.status}`);
       return r.blob();
     }
 
-    // HTTPS cross-origin: delegate to background service worker which has
-    // broader network access via host_permissions.
-    const result = await chrome.runtime.sendMessage({ action: 'fetchImage', url });
-    if (result?.error) throw new Error(result.error);
+    // Stage 2: raw Blob object received via GWR_BLOB (legacy path)
+    if (cachedData instanceof Blob) {
+      log('Stage 2: cached Blob object');
+      return cachedData;
+    }
+
+    // Stage 3: the intercept URL itself is a data: URL
+    if (url.startsWith('data:')) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`data: fetch failed: ${r.status}`);
+      return r.blob();
+    }
+
+    // Stage 4: blob: URL — only attempt fetch for KNOWN accessible origins.
+    // blob:null (sandboxed iframe) is detected here and skipped WITHOUT calling
+    // fetch() at all. Chrome logs blob:null fetch attempts to the extension error
+    // console even when caught by try/catch, so we must not call fetch() at all.
+    if (url.startsWith('blob:')) {
+      const isBlobNull = url.startsWith('blob:null');
+      if (!isBlobNull) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(`blob fetch HTTP ${r.status}`);
+          log('Stage 4: blob fetch succeeded');
+          return r.blob();
+        } catch (blobErr) {
+          log('Stage 4 failed:', blobErr.message, '— falling through to page-image fallback');
+        }
+      } else {
+        log('Stage 4 skipped: blob:null URL (sandboxed iframe) — going straight to fallback');
+      }
+      // blob: URL is inaccessible — fall through to stages 6 & 7
+    }
+
+    // Stage 5: plain HTTPS URL — delegate to background service worker
+    if (!url.startsWith('blob:')) {
+      const result = await chrome.runtime.sendMessage({ action: 'fetchImage', url });
+      if (!result?.error) {
+        log('Stage 5: HTTPS fetch via background succeeded');
+        return new Blob([new Uint8Array(result.buffer)], {
+          type: result.mimeType || 'image/png',
+        });
+      }
+      throw new Error(result.error);
+    }
+
+    // ── Stages 6 & 7: page-image fallback ────────────────────────────────────
+    // The blob URL is inaccessible (blob:null / revoked). The same image is
+    // always rendered in a visible <img> tag on the Gemini page — use that
+    // HTTPS URL instead. This is identical to what manual scan does.
+
+    // Stage 6: imgHint sent by main-world (most targeted — found near the anchor)
+    // Stage 7: our own DOM scan (broader — same as __UAI_scanImages)
+    const fallbackUrl = imgHint || findBestPageImageUrl();
+
+    if (!fallbackUrl) {
+      throw new Error(
+        'blob:null URL is inaccessible and no Gemini image found on this page. ' +
+        'Please use Manual Scan in the popup as a workaround.'
+      );
+    }
+
+    log('Stage 6/7: using page <img> fallback:', fallbackUrl.slice(0, 80));
+    const result = await chrome.runtime.sendMessage({ action: 'fetchImage', url: fallbackUrl });
+    if (result?.error) throw new Error(`Fallback fetch failed: ${result.error}`);
     return new Blob([new Uint8Array(result.buffer)], {
       type: result.mimeType || 'image/png',
     });
   }
 
+  // Scan the DOM for large Gemini-generated images.
+  // Uses the SAME URL patterns as __UAI_scanImages so it always matches
+  // whatever __UAI_scanImages finds (manual scan = direct download = same logic).
+  function findBestPageImageUrl() {
+    const imgs = Array.from(document.querySelectorAll('img[src]'));
+    for (let i = imgs.length - 1; i >= 0; i--) {
+      const img = imgs[i];
+      if (img.naturalWidth < 256 || img.naturalHeight < 256) continue;
+      const { src } = img;
+
+      // Exact same checks as __UAI_scanImages
+      if (src.startsWith('blob:')) continue; // blobs are also inaccessible here
+      if (
+        src.includes('googleusercontent.com') ||
+        src.includes('generativelanguage.googleapis.com') ||
+        src.includes('storage.googleapis.com') ||
+        src.includes('generatedimage')
+      ) return src;
+
+      // Broad fallback: any URL with a recognised image extension
+      try {
+        const path = new URL(src, location.href).pathname;
+        if (/\.(png|jpe?g|webp)(\?|$)/i.test(path)) return src;
+      } catch {}
+    }
+    return null;
+  }
+
   // ── Image Processing Pipeline ──────────────────────────────────────────────
   async function processImage(blob) {
-    const bitmap = await createImageBitmap(blob);
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(blob);
+    } catch (err) {
+      throw new Error(`Could not decode image: ${err.message}`);
+    }
+
     const W = bitmap.width, H = bitmap.height;
     log('Processing', W, '×', H, '| method:', cfg.method, '| format:', cfg.format);
 
     const canvas = document.createElement('canvas');
     const ctx    = canvas.getContext('2d', { willReadFrequently: true });
 
-    // ── CROP: trim bottom 8 % — removes badge AND sparkle in one shot ────────
+    // ── CROP: trim bottom 8 % ─────────────────────────────────────────────
     if (cfg.method === 'crop') {
       const cropH = Math.floor(H * 0.92);
       canvas.width  = W;
       canvas.height = cropH;
-      // drawImage(src, sx,sy,sw,sh, dx,dy,dw,dh) — crop from top
       ctx.drawImage(bitmap, 0, 0, W, cropH, 0, 0, W, cropH);
       bitmap.close();
 
     } else {
-      // SMART / FILL / STRIP: draw full image first.
-      // This single canvas re-encode already destroys the SynthID invisible watermark.
+      // SMART / FILL / STRIP: full-image draw destroys SynthID watermark.
       canvas.width  = W;
       canvas.height = H;
       ctx.drawImage(bitmap, 0, 0);
       bitmap.close();
 
-      // Remove the visible sparkle mark (skip for strip — re-encode only)
       if (cfg.removeVisible && cfg.method !== 'strip') {
         removeVisibleWatermark(ctx, W, H, cfg.method);
       }
     }
 
     const mime = cfg.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-    const qual = cfg.format === 'jpeg' ? 0.96 : undefined;
+    // v3.3: use configurable quality; fallback to 0.96
+    const qual = cfg.format === 'jpeg' ? (cfg.jpegQuality ?? 0.96) : undefined;
 
     return new Promise((res, rej) =>
       canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), mime, qual)
@@ -180,11 +335,8 @@
       inpaintRegion(data, W, H, region, method);
       ctx.putImageData(imgData, 0, 0);
     } else {
-      // ── Fallback: precision detection failed, clean the fixed corner zone ──
-      // Gemini ALWAYS places the ✦ mark in the bottom-right corner at the same
-      // absolute pixel offset. When the color/shape detector misses it (e.g. the
-      // image background is unusual), fill that fixed corner zone anyway.
-      // The content-aware fill makes this invisible on natural image content.
+      // Fallback: fixed corner zone — Gemini always places the ✦ in the
+      // bottom-right corner at the same relative offset.
       log('Sparkle not detected — applying corner-zone fallback');
       const sz = Math.max(72, Math.floor(Math.min(W, H) * 0.085));
       const fallback = { x: W - sz, y: H - sz, width: sz, height: sz };
@@ -197,29 +349,17 @@
   /**
    * Locates the Gemini ✦ watermark in the bottom-right corner using two
    * independent signals combined with OR logic. Either signal alone is enough
-   * to flag a pixel. False-positive clusters are then rejected by a density
-   * check so that scattered image-content edges don't produce spurious regions.
+   * to flag a pixel. False-positive clusters are rejected by a density check.
    *
-   * SIGNAL 1 — COLOR FINGERPRINT (background-independent):
-   *   Gemini's ✦ is always rendered in lavender-gray (R≈G mid-range, B dominant).
-   *   Range validated empirically from real Gemini exports.
+   * SIGNAL 1 — COLOR FINGERPRINT:
+   *   Gemini's ✦ is rendered in lavender-gray (R≈G mid-range, B dominant).
    *
    * SIGNAL 2 — 4-FOLD STAR STRUCTURE:
-   *   The ✦ arms (N/S/E/W) contrast with the diagonal gaps (NE/NW/SE/SW).
-   *   Threshold 14 — low enough to catch subtle sparkles on any background.
+   *   The ✦ arms (N/S/E/W) contrast with diagonal gaps (NE/NW/SE/SW).
    *
-   * DENSITY CHECK (replaces the AND requirement from the previous version):
-   *   After clustering, if flagged pixels are too sparse (< 4% fill of their
-   *   bounding box), the cluster is rejected. This handles false positives from
-   *   image content edges far better than requiring both signals simultaneously.
-   *
-   * WHY OR NOT AND:
-   *   On some image backgrounds the color fingerprint won't match (blending
-   *   alters the exact RGB). On others the star geometry is weak. OR ensures
-   *   at least one signal fires. The density check then validates the result.
+   * DENSITY CHECK: flagged pixels must be compact (≥4% fill of bounding box).
    */
   function detectSparkle(data, W, H) {
-    // Extended scan area — larger than before to catch the full mark
     const SCAN = Math.min(160, Math.floor(Math.min(W, H) * 0.17));
     const SX   = W - SCAN;
     const SY   = H - SCAN;
@@ -234,8 +374,7 @@
         const ci = (y * W + x) * 4;
         const r  = data[ci], g = data[ci + 1], b = data[ci + 2];
 
-        // ── Signal 1: lavender-gray color fingerprint ─────────────────────
-        // Widened slightly vs the original to handle image-blending variations.
+        // Signal 1: lavender-gray color fingerprint
         const isLavender = (
           r >= 95  && r <= 170 &&
           g >= 95  && g <= 170 &&
@@ -244,20 +383,18 @@
           b > r + 5
         );
 
-        // ── Signal 2: 4-fold star shape ───────────────────────────────────
-        const N  = lum(data[((y-ARM)*W+x)*4], data[((y-ARM)*W+x)*4+1], data[((y-ARM)*W+x)*4+2]);
-        const S  = lum(data[((y+ARM)*W+x)*4], data[((y+ARM)*W+x)*4+1], data[((y+ARM)*W+x)*4+2]);
-        const E  = lum(data[(y*W+(x+ARM))*4], data[(y*W+(x+ARM))*4+1], data[(y*W+(x+ARM))*4+2]);
-        const Ww = lum(data[(y*W+(x-ARM))*4], data[(y*W+(x-ARM))*4+1], data[(y*W+(x-ARM))*4+2]);
+        // Signal 2: 4-fold star shape luminance contrast
+        const N  = lum(data[((y-ARM)*W+x)*4],   data[((y-ARM)*W+x)*4+1], data[((y-ARM)*W+x)*4+2]);
+        const S  = lum(data[((y+ARM)*W+x)*4],   data[((y+ARM)*W+x)*4+1], data[((y+ARM)*W+x)*4+2]);
+        const E  = lum(data[(y*W+(x+ARM))*4],   data[(y*W+(x+ARM))*4+1], data[(y*W+(x+ARM))*4+2]);
+        const Ww = lum(data[(y*W+(x-ARM))*4],   data[(y*W+(x-ARM))*4+1], data[(y*W+(x-ARM))*4+2]);
         const d  = Math.round(ARM * 0.707);
         const NE = lum(data[((y-d)*W+(x+d))*4], data[((y-d)*W+(x+d))*4+1], data[((y-d)*W+(x+d))*4+2]);
         const NW = lum(data[((y-d)*W+(x-d))*4], data[((y-d)*W+(x-d))*4+1], data[((y-d)*W+(x-d))*4+2]);
         const SE = lum(data[((y+d)*W+(x+d))*4], data[((y+d)*W+(x+d))*4+1], data[((y+d)*W+(x+d))*4+2]);
         const SW = lum(data[((y+d)*W+(x-d))*4], data[((y+d)*W+(x-d))*4+1], data[((y+d)*W+(x-d))*4+2]);
-        // Threshold 14 — original value; sensitive enough for subtle sparkles
         const isStarShape = Math.abs((N+S+E+Ww)/4 - (NE+NW+SE+SW)/4) > 14;
 
-        // OR — either signal counts; density check (below) filters noise clusters
         if (isLavender || isStarShape) {
           minX = Math.min(minX, x); maxX = Math.max(maxX, x);
           minY = Math.min(minY, y); maxY = Math.max(maxY, y);
@@ -271,17 +408,14 @@
     const bw = maxX - minX + 1;
     const bh = maxY - minY + 1;
 
-    // ── Density check ──────────────────────────────────────────────────────
-    // Flagged pixels must form a compact cluster, not scattered edge noise.
-    // The sparkle occupies ≥ 4% of its own bounding box; random edges don't.
     const density = count / (bw * bh);
     if (density < 0.04) return null;
 
-    // Bounding box sanity: sparkle is always 6–120px
+    // Bounding-box sanity check
     if (bw > 120 || bh > 120) return null;
     if (bw <   5 || bh <   5) return null;
 
-    const pad = 10; // generous padding to ensure full mark is covered
+    const pad = 10;
     return {
       x:      Math.max(0, minX - pad),
       y:      Math.max(0, minY - pad),
@@ -292,23 +426,21 @@
 
   // ── Inpainting ─────────────────────────────────────────────────────────────
   /**
-   * Fills the detected watermark region using one of two strategies:
+   * 'smart' (v3.3 IMPROVED):
+   *   Inverse-distance-weighted average of surrounding ring pixels, with
+   *   Gaussian noise scaled to the local pixel standard deviation. This
+   *   produces a far more natural fill than the old flat-average + fixed jitter.
    *
-   * 'smart' — Weighted average of the surrounding ring of pixels, with subtle
-   *           luminance jitter to avoid an obvious flat patch.
-   *
-   * 'fill'  — Copies pixels from directly above the watermark region (mirrored
-   *           upward row-by-row). Works well when the background above the sparkle
-   *           is uniform or patterned (e.g. a plain sky or gradient).
+   * 'fill':
+   *   Copies pixels from directly above the watermark region (mirrored upward).
    */
   function inpaintRegion(data, W, H, bounds, method) {
     const { x, y, width: bw, height: bh } = bounds;
 
     if (method === 'fill') {
-      // Copy from directly above — row at (y-1) goes into row y, etc.
       for (let row = y; row < Math.min(H, y + bh); row++) {
-        const offset    = row - y;                    // 0, 1, 2, ...
-        const sourceRow = Math.max(0, y - offset - 1); // mirror upward
+        const offset    = row - y;
+        const sourceRow = Math.max(0, y - offset - 1);
         for (let col = x; col < Math.min(W, x + bw); col++) {
           const src = (sourceRow * W + col) * 4;
           const dst = (row       * W + col) * 4;
@@ -318,47 +450,67 @@
           data[dst + 3] = 255;
         }
       }
-    } else {
-      // 'smart': sample a ring of pixels around the watermark and average them
-      const samplePad = Math.max(14, Math.round(W * 0.014));
-      let rSum = 0, gSum = 0, bSum = 0, n = 0;
+      return;
+    }
 
-      const sx1 = Math.max(0, x - samplePad), sy1 = Math.max(0, y - samplePad);
-      const sx2 = Math.min(W, x + bw + samplePad), sy2 = Math.min(H, y + bh + samplePad);
+    // ── SMART: inverse-distance-weighted ring sample ───────────────────────
+    const samplePad = Math.max(18, Math.round(W * 0.018));
+    const sx1 = Math.max(0, x - samplePad);
+    const sy1 = Math.max(0, y - samplePad);
+    const sx2 = Math.min(W, x + bw + samplePad);
+    const sy2 = Math.min(H, y + bh + samplePad);
 
-      for (let sy = sy1; sy < sy2; sy++) {
-        for (let sx = sx1; sx < sx2; sx++) {
-          // Skip the watermark patch itself — only sample the ring around it
-          if (sx >= x && sx < x + bw && sy >= y && sy < y + bh) continue;
-          const i = (sy * W + sx) * 4;
-          rSum += data[i]; gSum += data[i + 1]; bSum += data[i + 2]; n++;
-        }
+    let rW = 0, gW = 0, bW = 0;
+    let rSq = 0, gSq = 0, bSq = 0;
+    let totalW = 0;
+
+    for (let sy = sy1; sy < sy2; sy++) {
+      for (let sx = sx1; sx < sx2; sx++) {
+        // Skip the watermark patch — only sample the surrounding ring
+        if (sx >= x && sx < x + bw && sy >= y && sy < y + bh) continue;
+        const i = (sy * W + sx) * 4;
+        const pr = data[i], pg = data[i + 1], pb = data[i + 2];
+
+        // Inverse-square distance weight (closer pixels influence more)
+        const dx = Math.max(0, sx < x ? x - sx : sx - (x + bw - 1));
+        const dy = Math.max(0, sy < y ? y - sy : sy - (y + bh - 1));
+        const w  = 1 / (dx * dx + dy * dy + 0.25);
+
+        rW += pr * w; gW += pg * w; bW += pb * w;
+        rSq += pr * pr * w; gSq += pg * pg * w; bSq += pb * pb * w;
+        totalW += w;
       }
+    }
 
-      const avgR = n ? Math.round(rSum / n) : 18;
-      const avgG = n ? Math.round(gSum / n) : 19;
-      const avgB = n ? Math.round(bSum / n) : 50;
+    const avgR = totalW ? rW / totalW : 18;
+    const avgG = totalW ? gW / totalW : 19;
+    const avgB = totalW ? bW / totalW : 50;
 
-      // Fill with tiny luminance jitter to avoid a visible flat patch
-      for (let row = y; row < Math.min(H, y + bh); row++) {
-        for (let col = x; col < Math.min(W, x + bw); col++) {
-          const i = (row * W + col) * 4;
-          const j = Math.round((Math.random() - 0.5) * 5);
-          data[i]     = clamp(avgR + j);
-          data[i + 1] = clamp(avgG + j);
-          data[i + 2] = clamp(avgB + j);
-          data[i + 3] = 255;
-        }
+    // Local standard deviation → realistic texture noise magnitude
+    const stdR = totalW ? Math.sqrt(Math.max(0, rSq / totalW - avgR * avgR)) : 4;
+    const stdG = totalW ? Math.sqrt(Math.max(0, gSq / totalW - avgG * avgG)) : 4;
+    const stdB = totalW ? Math.sqrt(Math.max(0, bSq / totalW - avgB * avgB)) : 4;
+
+    // Box-Muller Gaussian RNG — produces realistic pixel-level noise
+    function gaussNoise(std) {
+      if (std < 0.5) return 0; // nearly-uniform region — don't add noise
+      const u1 = Math.random(), u2 = Math.random();
+      return std * Math.sqrt(-2 * Math.log(u1 + 1e-10)) * Math.cos(2 * Math.PI * u2) * 0.45;
+    }
+
+    for (let row = y; row < Math.min(H, y + bh); row++) {
+      for (let col = x; col < Math.min(W, x + bw); col++) {
+        const i = (row * W + col) * 4;
+        data[i]     = clamp(avgR + gaussNoise(stdR));
+        data[i + 1] = clamp(avgG + gaussNoise(stdG));
+        data[i + 2] = clamp(avgB + gaussNoise(stdB));
+        data[i + 3] = 255;
       }
     }
   }
 
-  // ── Manual Scan API (called by popup via chrome.scripting.executeScript) ───
+  // ── Manual Scan API ────────────────────────────────────────────────────────
   window.__UAI_scanImages = function () {
-    // Look for images that are plausibly Gemini-generated:
-    // • Larger than 256 px on both axes (excludes icons, avatars, thumbnails)
-    // • Hosted on known Gemini image domains OR are blob URLs
-    // • De-duplicated by src
     const seen = new Set();
     const results = [];
 
@@ -367,13 +519,16 @@
       if (w < 256 || h < 256) return;
       if (seen.has(src)) return;
 
+      let parsedPathname = '';
+      try { parsedPathname = new URL(src, location.href).pathname; } catch {}
+
       const isGeminiSource =
         src.startsWith('blob:') ||
         src.includes('googleusercontent.com') ||
         src.includes('generativelanguage.googleapis.com') ||
         src.includes('storage.googleapis.com') ||
         src.includes('generatedimage') ||
-        /\.(png|jpe?g|webp)(\?|$)/i.test(new URL(src, location.href).pathname);
+        /\.(png|jpe?g|webp)(\?|$)/i.test(parsedPathname);
 
       if (!isGeminiSource) return;
 
@@ -381,16 +536,53 @@
       results.push({ src, width: w, height: h, alt: img.alt || '' });
     });
 
-    return results.slice(0, 24); // cap at 24 images to keep the grid manageable
+    return results.slice(0, 24);
+  };
+
+  // ── v3.3 NEW: Batch download all found images ──────────────────────────────
+  window.__UAI_downloadAll = async function () {
+    const images = window.__UAI_scanImages();
+    if (!images.length) return { ok: false, error: 'No images found on page' };
+
+    let succeeded = 0;
+    let failed = 0;
+    const errors = [];
+
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i];
+      const filename = `unmark-ai-${i + 1}-of-${images.length}.png`;
+      try {
+        const rawBlob   = await fetchImage(img.src, blobCache.get(img.src));
+        const cleanBlob = await processImage(rawBlob);
+        const dataUrl   = await blobToDataURL(cleanBlob);
+
+        window.postMessage({
+          gwrType:  'GWR_DOWNLOAD',
+          dataUrl,
+          filename: normalizeFilename(filename),
+        }, '*');
+
+        await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
+
+        // Stagger downloads so browser doesn't throttle
+        await new Promise(r => setTimeout(r, 350));
+        succeeded++;
+      } catch (e) {
+        failed++;
+        errors.push(e.message);
+        log('downloadAll — image', i + 1, 'failed:', e.message);
+      }
+    }
+
+    return { ok: succeeded > 0, succeeded, failed, total: images.length, errors };
   };
 
   window.__UAI_processAndDownload = async function (url, filename) {
     try {
-      const rawBlob   = await fetchImage(url);
+      const rawBlob   = await fetchImage(url, blobCache.get(url), null);
       const cleanBlob = await processImage(rawBlob);
       const dataUrl   = await blobToDataURL(cleanBlob);
 
-      // Tell main world to trigger the actual browser download
       window.postMessage({
         gwrType:  'GWR_DOWNLOAD',
         dataUrl,
@@ -405,7 +597,7 @@
     }
   };
 
-  // Keep old name as alias so background.js fallback still works if page not refreshed
+  // Keep old names as aliases so background.js fallback still works if page not refreshed
   window.__GWR_processAndDownload = window.__UAI_processAndDownload;
   window.__GWR_scanImages         = window.__UAI_scanImages;
 
@@ -422,16 +614,9 @@
     });
   }
 
-  /**
-   * Produces a clean filename for the downloaded file.
-   * BUG FIX: previous version kept the original extension even when the output
-   * format differed (e.g. output was JPEG but filename stayed ".png").
-   * Now always replaces any existing image extension with the correct one.
-   */
   function normalizeFilename(name) {
     if (!name) return 'unmark-ai-clean.png';
     const ext  = cfg.format === 'jpeg' ? '.jpg' : '.png';
-    // Strip any existing image extension, then append the correct one
     const base = name.replace(/\.(png|jpe?g|jpg|webp|gif|bmp|avif)$/i, '');
     return base + ext;
   }
@@ -477,7 +662,7 @@
     toastTimer = setTimeout(() => {
       el.style.opacity   = '0';
       el.style.transform = 'translateY(10px)';
-    }, 4000);
+    }, type === 'error' ? 5500 : 4000); // errors stay a bit longer
   }
 
   function log(...args) {

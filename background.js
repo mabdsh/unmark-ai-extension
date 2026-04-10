@@ -1,13 +1,26 @@
 /**
- * UnmarkAI v3.2 — Background Service Worker
+ * UnmarkAI v3.3 — Background Service Worker
  *
  * TWO INTERCEPTION PATHS:
  *   PRIMARY  — main-world.js prototype overrides (JS-level, instant)
  *   FALLBACK — downloads.onCreated (catches ALL Chrome downloads including
  *              direct URL downloads that bypass JS prototype overrides)
  *
- * DEDUPLICATION: processedUrls Set prevents both paths from firing on the
+ * DEDUPLICATION: processedUrls Map prevents both paths from firing on the
  * same download, which would produce a double-download for the user.
+ *
+ * CHANGES v3.3 → v3.4 (direct-download fix):
+ *   ROOT CAUSE FIX: downloads.onCreated fallback now calls
+ *   chrome.downloads.cancel(item.id) immediately, preventing the watermarked
+ *   file from landing on disk before we finish processing.
+ *   Previously the original download always completed — users got the
+ *   watermarked file even when our fallback ran successfully.
+ *
+ *   RELIABILITY FIX: replaced referrer-based Gemini detection with an
+ *   open-Gemini-tab check. Chrome does not always populate item.referrer
+ *   for blob: downloads (there's no HTTP request, so no Referer header),
+ *   causing the old isFromGemini() to return false and skip the fallback
+ *   entirely for the most common Gemini download type.
  */
 'use strict';
 
@@ -17,8 +30,8 @@ const GRAY          = '#6B7280';
 
 let sessionCount = 0;
 
-// Track URLs currently being processed to prevent double-download.
-// Entries are auto-expired after 30 s so stale locks never block future downloads.
+// ── URL lock registry ─────────────────────────────────────────────────────
+// Entries auto-expire after 30 s so stale locks never block future downloads.
 const processedUrls = new Map(); // url → expiry timestamp
 
 function lockUrl(url) {
@@ -42,6 +55,7 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
       removeSynthID:     true,
       method:            'smart',
       format:            'png',
+      jpegQuality:       0.96,
       showNotifications: true,
     },
     stats: { totalRemoved: 0, lastReset: Date.now() },
@@ -83,27 +97,39 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 // ── FALLBACK: downloads.onCreated ────────────────────────────────────────────
-// Fires for every Chrome download. Filtered to Gemini images only.
-// Skipped when main-world.js already intercepted the same URL (via processedUrls lock).
+// Fires for every Chrome download. Acts as the safety net when main-world.js
+// fails to intercept (e.g. if the page was loaded before the extension).
+//
+// v3.4 ROOT CAUSE FIX:
+//   1. Immediately cancels the original download so the watermarked file never
+//      lands on disk — this was missing before and caused users to always receive
+//      the watermarked version even when our fallback processing succeeded.
+//   2. Detects "from Gemini" by checking whether ANY Gemini tab is currently
+//      open, rather than checking item.referrer. Chrome does not populate
+//      referrer for blob: downloads (no HTTP request = no Referer header), so
+//      the old isFromGemini() silently returned false for most Gemini downloads.
 chrome.downloads.onCreated.addListener(async (item) => {
   try {
+    if (!item?.url) return;
+
     const { settings } = await chrome.storage.sync.get('settings');
     if (!settings?.enabled) return;
 
-    // Skip our own clean-download data URLs — they start with data:
+    // Skip our own clean-download data URLs
     if (item.url.startsWith('data:')) return;
 
-    // Only process image MIME types or clear image URL patterns
+    // Only process images (by MIME or by URL extension)
     const isImage =
       (item.mime || '').startsWith('image/') ||
       /\.(png|jpe?g|webp|gif)(\?|$)/i.test(item.url);
     if (!isImage) return;
 
-    // Only from Gemini / AI Studio
-    const fromGemini = GEMINI_HOSTS.some(
-      h => item.referrer?.includes(h) || item.url?.includes(h)
-    );
-    if (!fromGemini) return;
+    // v3.4 FIX: check for an open Gemini tab instead of relying on referrer.
+    // This is reliable for all download types (blob:, https:, data:).
+    const geminiTabs = await chrome.tabs.query({
+      url: ['https://gemini.google.com/*', 'https://aistudio.google.com/*'],
+    }).catch(() => []);
+    if (!geminiTabs.length) return;
 
     // Skip if already handled by main-world.js primary path
     if (isLocked(item.url)) {
@@ -114,19 +140,16 @@ chrome.downloads.onCreated.addListener(async (item) => {
     lockUrl(item.url);
     console.log('[UAI bg] fallback intercept:', item.url.slice(0, 80));
 
-    // Find an open Gemini tab to run processing in
-    const tabs = await chrome.tabs.query({
-      url: ['https://gemini.google.com/*', 'https://aistudio.google.com/*'],
-    }).catch(() => []);
+    // v3.4 FIX: cancel the original download IMMEDIATELY so the watermarked
+    // file is never written to disk. Do this before the async processing below.
+    await chrome.downloads.cancel(item.id).catch(() => {});
+    // Erase it from the downloads shelf so the user doesn't see a cancelled entry
+    await chrome.downloads.erase({ id: item.id }).catch(() => {});
 
-    const tab = tabs.find(t => t.active) || tabs[0];
-    if (!tab) {
-      console.warn('[UAI bg] No Gemini tab found for fallback processing');
-      unlockUrl(item.url);
-      return;
-    }
+    // Use the active Gemini tab for processing, fall back to any Gemini tab
+    const tab = geminiTabs.find(t => t.active) || geminiTabs[0];
 
-    // Build a clean output filename
+    // Build a clean output filename from whatever Chrome recorded
     const orig  = (item.filename || 'gemini-image').split(/[/\\]/).pop();
     const clean = orig.replace(/(\.[a-z]+)?$/i, '-clean.png');
 
