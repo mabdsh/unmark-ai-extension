@@ -36,6 +36,24 @@ let sessionCount = 0;
 // chrome.downloads.download(), decremented in onCreated when we skip one.
 let pendingCleanDownloads = 0;
 
+// Cache whether a Gemini tab is currently the active tab.
+// Used to synchronously pre-cancel blob:null downloads (which have no origin
+// we can check synchronously) before any async await introduces race-condition
+// delays. Updated by tab focus / navigation events.
+let geminiTabActive = false;
+
+function updateGeminiTabActive(tabId) {
+  chrome.tabs.get(tabId, (tab) => {
+    if (chrome.runtime.lastError) return;
+    geminiTabActive = GEMINI_HOSTS.some(h => (tab.url || '').includes(h));
+  });
+}
+
+chrome.tabs.onActivated.addListener((info) => updateGeminiTabActive(info.tabId));
+chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+  if (tab.active && change.url) updateGeminiTabActive(tabId);
+});
+
 // ── URL lock registry ─────────────────────────────────────────────────────
 // Entries auto-expire after 30 s so stale locks never block future downloads.
 const processedUrls = new Map(); // url → expiry timestamp
@@ -135,12 +153,19 @@ chrome.downloads.onCreated.addListener(async (item) => {
     // to be fully saved, making the cancel a no-op.
     //
     // Fix: detect Gemini blob downloads SYNCHRONOUSLY and cancel IMMEDIATELY
-    // before the first await. We check item.url for the Gemini origin inline.
-    const isGeminiBlob = item.url.startsWith('blob:') &&
+    // before the first await.
+    //   • blob:https://gemini.google.com/uuid → detected by URL alone
+    //   • blob:null/uuid (sandboxed iframe) → URL has no origin, use the
+    //     cached geminiTabActive flag which is kept current by tab listeners
+    const isKnownGeminiBlob = item.url.startsWith('blob:') &&
       GEMINI_HOSTS.some(h => item.url.includes(h));
-    if (isGeminiBlob) {
+    const isNullOriginBlobOnGemini = item.url.startsWith('blob:null') && geminiTabActive;
+    const shouldPreCancel = isKnownGeminiBlob || isNullOriginBlobOnGemini;
+
+    if (shouldPreCancel) {
       chrome.downloads.cancel(item.id).catch(() => {}); // fire-and-forget, no await
-      console.log('[UAI bg] synchronous pre-cancel for Gemini blob:', item.id);
+      console.log('[UAI bg] synchronous pre-cancel for Gemini blob:', item.id,
+        isNullOriginBlobOnGemini ? '(blob:null)' : '(known origin)');
     }
     // ── end race-condition fix ────────────────────────────────────────────────
 
@@ -173,7 +198,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
 
     // For non-blob downloads (HTTPS), cancel here (after async checks)
     // For blob downloads we already cancelled synchronously above
-    if (!isGeminiBlob) {
+    if (!shouldPreCancel) {
       await chrome.downloads.cancel(item.id).catch(() => {});
     }
     // Erase from the downloads shelf so the user doesn't see a cancelled entry

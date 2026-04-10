@@ -97,6 +97,41 @@
     return url;
   };
 
+  // ── Capture real user clicks on download anchor elements ─────────────────
+  // The .click() override and dispatchEvent override only intercept PROGRAMMATIC
+  // clicks from JavaScript code. A real user mouse-click on an <a download> link
+  // goes through the browser's native input handler, which dispatches the click
+  // event internally at the C++ level — it never calls JS prototype methods.
+  //
+  // Without this listener, the flow is:
+  //   user click → browser follows href → Chrome creates download → onCreated
+  //   → our cancel races the file write (and loses for fast blob downloads)
+  //   → original watermarked file saved BEFORE we can stop it
+  //
+  // With capture=true this fires BEFORE Angular/React handlers and before the
+  // browser follows the link. e.preventDefault() stops the native download.
+  document.addEventListener('click', function uaiCaptureClick(e) {
+    if (!enabled) return;
+
+    // Walk up from the clicked element to find the nearest <a>
+    const anchor = e.target.closest('a');
+    if (!anchor || anchor._uaiDone) return;
+
+    const href = anchor.href;
+    if (!href || !looksLikeGeminiImage(href)) return;
+
+    // Only intercept anchors that are intended as downloads (have download attr)
+    // to avoid breaking normal image navigation links
+    if (!anchor.hasAttribute('download')) return;
+
+    e.preventDefault();
+    e.stopImmediatePropagation(); // prevent Angular from also triggering a download
+
+    const filename = anchor.getAttribute('download') || guessFilename(href);
+    log('Intercepted real user click on', href.slice(0, 70));
+    sendIntercept(href, filename);
+  }, true /* capture phase */);
+
   // ── Override: programmatic .click() on anchor elements ──────────────────
   // ROOT CAUSE FIX v3.4: removed `!this.hasAttribute('download')` guard.
   // Gemini creates plain <a href="..."> without a download attribute, which
