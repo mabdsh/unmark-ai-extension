@@ -30,6 +30,12 @@ const GRAY          = '#6B7280';
 
 let sessionCount = 0;
 
+// Tracks how many clean downloads WE triggered via chrome.downloads.download().
+// downloads.onCreated must skip exactly this many upcoming download events so it
+// doesn't cancel our own processed output. Incremented before calling
+// chrome.downloads.download(), decremented in onCreated when we skip one.
+let pendingCleanDownloads = 0;
+
 // ── URL lock registry ─────────────────────────────────────────────────────
 // Entries auto-expire after 30 s so stale locks never block future downloads.
 const processedUrls = new Map(); // url → expiry timestamp
@@ -112,6 +118,32 @@ chrome.downloads.onCreated.addListener(async (item) => {
   try {
     if (!item?.url) return;
 
+    // Skip our own clean downloads (tracked by counter — see downloadClean handler)
+    if (pendingCleanDownloads > 0) {
+      pendingCleanDownloads--;
+      console.log('[UAI bg] skipping own clean download, remaining pending:', pendingCleanDownloads);
+      return;
+    }
+
+    // Skip our own data: URL outputs (belt-and-suspenders with the counter above)
+    if (item.url.startsWith('data:')) return;
+
+    // ── v3.6 RACE-CONDITION FIX ──────────────────────────────────────────────
+    // Blob downloads (the most common Gemini download type) complete nearly
+    // instantly — the blob is already in memory, just needs to be written to disk.
+    // Any await before chrome.downloads.cancel() gives enough time for the file
+    // to be fully saved, making the cancel a no-op.
+    //
+    // Fix: detect Gemini blob downloads SYNCHRONOUSLY and cancel IMMEDIATELY
+    // before the first await. We check item.url for the Gemini origin inline.
+    const isGeminiBlob = item.url.startsWith('blob:') &&
+      GEMINI_HOSTS.some(h => item.url.includes(h));
+    if (isGeminiBlob) {
+      chrome.downloads.cancel(item.id).catch(() => {}); // fire-and-forget, no await
+      console.log('[UAI bg] synchronous pre-cancel for Gemini blob:', item.id);
+    }
+    // ── end race-condition fix ────────────────────────────────────────────────
+
     const { settings } = await chrome.storage.sync.get('settings');
     if (!settings?.enabled) return;
 
@@ -138,12 +170,13 @@ chrome.downloads.onCreated.addListener(async (item) => {
     }
 
     lockUrl(item.url);
-    console.log('[UAI bg] fallback intercept:', item.url.slice(0, 80));
 
-    // v3.4 FIX: cancel the original download IMMEDIATELY so the watermarked
-    // file is never written to disk. Do this before the async processing below.
-    await chrome.downloads.cancel(item.id).catch(() => {});
-    // Erase it from the downloads shelf so the user doesn't see a cancelled entry
+    // For non-blob downloads (HTTPS), cancel here (after async checks)
+    // For blob downloads we already cancelled synchronously above
+    if (!isGeminiBlob) {
+      await chrome.downloads.cancel(item.id).catch(() => {});
+    }
+    // Erase from the downloads shelf so the user doesn't see a cancelled entry
     await chrome.downloads.erase({ id: item.id }).catch(() => {});
 
     // Use the active Gemini tab for processing, fall back to any Gemini tab
@@ -183,6 +216,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       lockUrl(msg.url);
       sendResponse({ ok: true });
       return false;
+
+    // v3.6: content.js sends processed image data here.
+    // chrome.downloads.download() is used instead of <a> click in main-world
+    // because: (1) it doesn't need a user gesture, (2) we can track it with
+    // pendingCleanDownloads so onCreated doesn't cancel our own output.
+    case 'downloadClean': {
+      pendingCleanDownloads++;
+      chrome.downloads.download(
+        {
+          url:            msg.dataUrl,
+          filename:       msg.filename,
+          saveAs:         false,
+          conflictAction: 'uniquify',
+        },
+        (downloadId) => {
+          if (chrome.runtime.lastError || !downloadId) {
+            // Download never created — undo the counter increment so we don't
+            // skip a future real Gemini download by mistake.
+            pendingCleanDownloads = Math.max(0, pendingCleanDownloads - 1);
+            sendResponse({ ok: false, error: chrome.runtime.lastError?.message || 'Download failed to start' });
+          } else {
+            sendResponse({ ok: true, downloadId });
+          }
+        }
+      );
+      return true; // keep channel open for async callback
+    }
 
     case 'fetchImage':
       fetch(msg.url, { credentials: 'include', cache: 'no-store' })

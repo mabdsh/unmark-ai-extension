@@ -138,16 +138,24 @@
     try {
       const rawBlob   = await fetchImage(url, cachedData, imgHint);
       const cleanBlob = await processImage(rawBlob);
-      const dataUrl   = await blobToDataURL(cleanBlob);
 
-      window.postMessage({
-        gwrType:  'GWR_DOWNLOAD',
-        dataUrl,
+      // v3.6 FIX: Use chrome.downloads.download() via background instead of
+      // postMessage → doDownload(dataUrl) in main-world. The old path created
+      // a Chrome download entry that our own downloads.onCreated listener then
+      // detected as a "Gemini image download" and cancelled, because Chrome
+      // internally converts <a href="data:..." download> clicks into blob: URLs
+      // which don't match our data: URL skip-check.
+      // chrome.downloads.download() is privileged and tracked with a counter
+      // so onCreated knows to skip it.
+      const dlResult = await chrome.runtime.sendMessage({
+        action:   'downloadClean',
+        dataUrl:  await blobToDataURL(cleanBlob),
         filename: normalizeFilename(filename),
-      }, '*');
+      });
+      if (!dlResult?.ok) throw new Error(dlResult?.error || 'chrome.downloads.download failed');
 
       await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
-      toast('Watermark removed!', 'success');
+      toast('Watermark removed ✓', 'success');
       log('Processed:', filename);
     } catch (err) {
       log('Processing error:', err.message);
@@ -255,6 +263,11 @@
   // Scan the DOM for large Gemini-generated images.
   // Uses the SAME URL patterns as __UAI_scanImages so it always matches
   // whatever __UAI_scanImages finds (manual scan = direct download = same logic).
+  //
+  // v3.6 FIX: only skip blob:null (sandboxed-iframe, truly inaccessible).
+  // blob:https://gemini.google.com/uuid are same-origin blobs — content scripts
+  // CAN fetch them (Stage 4), and they're what Gemini uses for <img src>.
+  // The old "skip all blob:" was why the fallback always returned null.
   function findBestPageImageUrl() {
     const imgs = Array.from(document.querySelectorAll('img[src]'));
     for (let i = imgs.length - 1; i >= 0; i--) {
@@ -262,8 +275,13 @@
       if (img.naturalWidth < 256 || img.naturalHeight < 256) continue;
       const { src } = img;
 
-      // Exact same checks as __UAI_scanImages
-      if (src.startsWith('blob:')) continue; // blobs are also inaccessible here
+      // Only skip null-origin blobs — same-origin blobs ARE fetchable
+      if (src.startsWith('blob:null')) continue;
+
+      // Same-origin blob: URL (blob:https://gemini.google.com/...) — accept
+      if (src.startsWith('blob:')) return src;
+
+      // Known Gemini HTTPS image domains
       if (
         src.includes('googleusercontent.com') ||
         src.includes('generativelanguage.googleapis.com') ||
@@ -554,18 +572,18 @@
       try {
         const rawBlob   = await fetchImage(img.src, blobCache.get(img.src));
         const cleanBlob = await processImage(rawBlob);
-        const dataUrl   = await blobToDataURL(cleanBlob);
 
-        window.postMessage({
-          gwrType:  'GWR_DOWNLOAD',
-          dataUrl,
+        const dlResult = await chrome.runtime.sendMessage({
+          action:   'downloadClean',
+          dataUrl:  await blobToDataURL(cleanBlob),
           filename: normalizeFilename(filename),
-        }, '*');
+        });
+        if (!dlResult?.ok) throw new Error(dlResult?.error || 'Download failed');
 
         await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
 
         // Stagger downloads so browser doesn't throttle
-        await new Promise(r => setTimeout(r, 350));
+        await new Promise(r => setTimeout(r, 400));
         succeeded++;
       } catch (e) {
         failed++;
@@ -581,13 +599,13 @@
     try {
       const rawBlob   = await fetchImage(url, blobCache.get(url), null);
       const cleanBlob = await processImage(rawBlob);
-      const dataUrl   = await blobToDataURL(cleanBlob);
 
-      window.postMessage({
-        gwrType:  'GWR_DOWNLOAD',
-        dataUrl,
+      const dlResult = await chrome.runtime.sendMessage({
+        action:   'downloadClean',
+        dataUrl:  await blobToDataURL(cleanBlob),
         filename: normalizeFilename(filename),
-      }, '*');
+      });
+      if (!dlResult?.ok) throw new Error(dlResult?.error || 'Download failed');
 
       await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
       return { ok: true };

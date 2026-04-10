@@ -202,22 +202,31 @@
     });
   }
 
-  // Walk the DOM for large Gemini-hosted images — same URL patterns as
+  // Walk the DOM for large Gemini-generated images — same URL patterns as
   // __UAI_scanImages so imgHint always matches what manual scan can find.
+  //
+  // v3.6 FIX: only skip blob:null. blob:https://gemini.google.com/uuid are
+  // same-origin blobs (accessible) and are what Gemini uses for <img src>.
   function findNearestGeminiImageUrl() {
     const imgs = Array.from(document.querySelectorAll('img[src]'));
     for (let i = imgs.length - 1; i >= 0; i--) {
       const img = imgs[i];
       if (img.naturalWidth < 256 || img.naturalHeight < 256) continue;
       const { src } = img;
-      if (src.startsWith('blob:')) continue; // skip inaccessible blobs
+
+      // Only skip null-origin blobs (sandboxed iframe — truly inaccessible)
+      if (src.startsWith('blob:null')) continue;
+
+      // Same-origin blob (blob:https://gemini.google.com/...) — accept
+      if (src.startsWith('blob:')) return src;
+
       if (
         src.includes('googleusercontent.com') ||
         src.includes('generativelanguage.googleapis.com') ||
         src.includes('storage.googleapis.com') ||
         src.includes('generatedimage')
       ) return src;
-      // Broad fallback: any URL with a recognised image extension
+
       try {
         const path = new URL(src).pathname;
         if (/\.(png|jpe?g|webp)(\?|$)/i.test(path)) return src;
