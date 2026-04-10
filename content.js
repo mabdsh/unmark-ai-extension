@@ -162,6 +162,9 @@
       if (!dlResult?.ok) throw new Error(dlResult?.error || 'chrome.downloads.download failed');
 
       await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
+      // Clear the click hint so it doesn't affect the next download if jslog fails
+      delete document.documentElement.dataset.uaiClickedSrc;
+      delete document.documentElement.dataset.uaiClickedTime;
       toast('Watermark removed ✓', 'success');
       log('Processed:', filename);
     } catch (err) {
@@ -255,12 +258,14 @@
     //   4. findBestPageImageUrl() — DOM scan (last resort, often latest image)
     const clickedSrc  = document.documentElement.dataset.uaiClickedSrc  || null;
     const clickedTime = parseInt(document.documentElement.dataset.uaiClickedTime || '0', 10);
-    // Use clicked hint within 10 seconds (generous window — click always precedes download)
-    const clickHint   = (clickedSrc && Date.now() - clickedTime < 10000) ? clickedSrc : null;
+    // 60-second window: user may hover other images after clicking download
+    // before background.js processes it. Click is always more precise than hover.
+    const clickHint   = (clickedSrc && Date.now() - clickedTime < 60000) ? clickedSrc : null;
 
     const domSrc      = document.documentElement.dataset.uaiHoveredSrc  || null;
     const domTime     = parseInt(document.documentElement.dataset.uaiHoveredTime || '0', 10);
-    const recentHover = (domSrc && Date.now() - domTime < 10000) ? domSrc : null;
+    // 5-second hover window — only use if no click hint available
+    const recentHover = (domSrc && Date.now() - domTime < 5000) ? domSrc : null;
 
     const fallbackUrl = imgHint || clickHint || recentHover || findBestPageImageUrl();
 
@@ -380,29 +385,43 @@
       inpaintRegion(data, W, H, region, method);
       ctx.putImageData(imgData, 0, 0);
     } else {
-      // Fallback: fixed corner zone — Gemini always places the ✦ in the
-      // bottom-right corner at the same relative offset.
-      log('Sparkle not detected — applying corner-zone fallback');
-      const sz = Math.max(72, Math.floor(Math.min(W, H) * 0.085));
-      const fallback = { x: W - sz, y: H - sz, width: sz, height: sz };
-      inpaintRegion(data, W, H, fallback, method);
-      ctx.putImageData(imgData, 0, 0);
+      // Fallback: only apply if the corner actually contains sparkle-like pixels.
+      // Without this guard, images without a sparkle get a visible flat-color
+      // patch in the bottom-right corner (the IDW average of edge pixels is
+      // a single blended color with no variation from the missing samples).
+      const sz = Math.max(56, Math.floor(Math.min(W, H) * 0.075));
+      if (cornerLooksLikeSparkle(data, W, H, sz)) {
+        log('Sparkle not detected precisely — applying corner-zone fallback');
+        const fallback = { x: W - sz, y: H - sz, width: sz, height: sz };
+        inpaintRegion(data, W, H, fallback, method);
+        ctx.putImageData(imgData, 0, 0);
+      } else {
+        log('No sparkle-like pixels in corner — skipping fallback to avoid artifact');
+      }
     }
+  }
+
+  // Quick scan: does the bottom-right corner contain any blue-tinted
+  // lighter-than-background pixels that could be Gemini's ✦ watermark?
+  function cornerLooksLikeSparkle(data, W, H, sz) {
+    const startX = W - sz, startY = H - sz;
+    let flagged = 0;
+    for (let y = startY; y < H; y++) {
+      for (let x = startX; x < W; x++) {
+        const i = (y * W + x) * 4;
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        // Broad lavender/light-blue: anything brighter than average with blue bias
+        if (b > r + 2 && r > 60 && b > 90 && r < 220) flagged++;
+      }
+    }
+    // At least 1.5% of the corner must look sparkle-like
+    return (flagged / (sz * sz)) >= 0.015;
   }
 
   // ── Sparkle Detector ───────────────────────────────────────────────────────
   /**
    * Locates the Gemini ✦ watermark in the bottom-right corner using two
-   * independent signals combined with OR logic. Either signal alone is enough
-   * to flag a pixel. False-positive clusters are rejected by a density check.
-   *
-   * SIGNAL 1 — COLOR FINGERPRINT:
-   *   Gemini's ✦ is rendered in lavender-gray (R≈G mid-range, B dominant).
-   *
-   * SIGNAL 2 — 4-FOLD STAR STRUCTURE:
-   *   The ✦ arms (N/S/E/W) contrast with diagonal gaps (NE/NW/SE/SW).
-   *
-   * DENSITY CHECK: flagged pixels must be compact (≥4% fill of bounding box).
+   * independent signals combined with OR logic.
    */
   function detectSparkle(data, W, H) {
     const SCAN = Math.min(160, Math.floor(Math.min(W, H) * 0.17));
@@ -419,13 +438,13 @@
         const ci = (y * W + x) * 4;
         const r  = data[ci], g = data[ci + 1], b = data[ci + 2];
 
-        // Signal 1: lavender-gray color fingerprint
+        // Signal 1: lavender-gray color fingerprint (slightly broadened ranges)
         const isLavender = (
-          r >= 95  && r <= 170 &&
-          g >= 95  && g <= 170 &&
-          b >= 128 && b <= 198 &&
-          Math.abs(r - g) < 30 &&
-          b > r + 5
+          r >= 80  && r <= 185 &&
+          g >= 80  && g <= 185 &&
+          b >= 110 && b <= 215 &&
+          Math.abs(r - g) < 35 &&
+          b > r + 3
         );
 
         // Signal 2: 4-fold star shape luminance contrast
@@ -438,7 +457,7 @@
         const NW = lum(data[((y-d)*W+(x-d))*4], data[((y-d)*W+(x-d))*4+1], data[((y-d)*W+(x-d))*4+2]);
         const SE = lum(data[((y+d)*W+(x+d))*4], data[((y+d)*W+(x+d))*4+1], data[((y+d)*W+(x+d))*4+2]);
         const SW = lum(data[((y+d)*W+(x-d))*4], data[((y+d)*W+(x-d))*4+1], data[((y+d)*W+(x-d))*4+2]);
-        const isStarShape = Math.abs((N+S+E+Ww)/4 - (NE+NW+SE+SW)/4) > 14;
+        const isStarShape = Math.abs((N+S+E+Ww)/4 - (NE+NW+SE+SW)/4) > 12;
 
         if (isLavender || isStarShape) {
           minX = Math.min(minX, x); maxX = Math.max(maxX, x);
@@ -448,17 +467,16 @@
       }
     }
 
-    if (count < 6 || minX === Infinity) return null;
+    if (count < 4 || minX === Infinity) return null;
 
     const bw = maxX - minX + 1;
     const bh = maxY - minY + 1;
 
     const density = count / (bw * bh);
-    if (density < 0.04) return null;
+    if (density < 0.02) return null;   // lowered from 0.04 → catches lighter sparkles
 
-    // Bounding-box sanity check
-    if (bw > 120 || bh > 120) return null;
-    if (bw <   5 || bh <   5) return null;
+    if (bw > 130 || bh > 130) return null;
+    if (bw <   4 || bh <   4) return null;
 
     const pad = 10;
     return {
@@ -498,57 +516,77 @@
       return;
     }
 
-    // ── SMART: inverse-distance-weighted ring sample ───────────────────────
-    const samplePad = Math.max(18, Math.round(W * 0.018));
+    // ── SMART: per-pixel inverse-distance-weighted fill ───────────────────────
+    // Use a generous sampling pad — at least 3× the patch size so edge regions
+    // (where the image boundary truncates one side of the ring) still gather
+    // enough valid pixels to compute an accurate local colour estimate.
+    const basePad   = Math.max(32, Math.round(Math.min(W, H) * 0.035));
+    // Extra padding for corner/edge regions where the ring is partially missing
+    const atRight   = (x + bw >= W - 8);
+    const atBottom  = (y + bh >= H - 8);
+    const extraPad  = (atRight || atBottom) ? basePad : 0;
+    const samplePad = basePad + extraPad;
+
     const sx1 = Math.max(0, x - samplePad);
     const sy1 = Math.max(0, y - samplePad);
     const sx2 = Math.min(W, x + bw + samplePad);
     const sy2 = Math.min(H, y + bh + samplePad);
 
-    let rW = 0, gW = 0, bW = 0;
-    let rSq = 0, gSq = 0, bSq = 0;
-    let totalW = 0;
+    // Compute per-pixel fill using IDW from the sampling ring so each pixel
+    // gets a local estimate rather than a single global average for the whole
+    // patch (which is what causes the flat-colour look in large regions).
+    const fillR = new Float32Array(bw * bh);
+    const fillG = new Float32Array(bw * bh);
+    const fillB = new Float32Array(bw * bh);
+    const fillStdR = new Float32Array(bw * bh);
+    const fillStdG = new Float32Array(bw * bh);
+    const fillStdB = new Float32Array(bw * bh);
 
+    // Collect ring samples once
+    const ringPx = [];
     for (let sy = sy1; sy < sy2; sy++) {
       for (let sx = sx1; sx < sx2; sx++) {
-        // Skip the watermark patch — only sample the surrounding ring
         if (sx >= x && sx < x + bw && sy >= y && sy < y + bh) continue;
         const i = (sy * W + sx) * 4;
-        const pr = data[i], pg = data[i + 1], pb = data[i + 2];
-
-        // Inverse-square distance weight (closer pixels influence more)
-        const dx = Math.max(0, sx < x ? x - sx : sx - (x + bw - 1));
-        const dy = Math.max(0, sy < y ? y - sy : sy - (y + bh - 1));
-        const w  = 1 / (dx * dx + dy * dy + 0.25);
-
-        rW += pr * w; gW += pg * w; bW += pb * w;
-        rSq += pr * pr * w; gSq += pg * pg * w; bSq += pb * pb * w;
-        totalW += w;
+        ringPx.push({ r: data[i], g: data[i+1], b: data[i+2], sx, sy });
       }
     }
 
-    const avgR = totalW ? rW / totalW : 18;
-    const avgG = totalW ? gW / totalW : 19;
-    const avgB = totalW ? bW / totalW : 50;
+    // For each pixel in the patch, IDW-weight the ring samples by distance
+    for (let row = y; row < Math.min(H, y + bh); row++) {
+      for (let col = x; col < Math.min(W, x + bw); col++) {
+        let rW = 0, gW = 0, bW = 0, rSq = 0, gSq = 0, bSq = 0, totalW = 0;
+        for (const p of ringPx) {
+          const dx = p.sx - col, dy = p.sy - row;
+          const w  = 1 / (dx * dx + dy * dy + 0.25);
+          rW += p.r * w; gW += p.g * w; bW += p.b * w;
+          rSq += p.r * p.r * w; gSq += p.g * p.g * w; bSq += p.b * p.b * w;
+          totalW += w;
+        }
+        const pi = (row - y) * bw + (col - x);
+        fillR[pi] = totalW ? rW / totalW : 18;
+        fillG[pi] = totalW ? gW / totalW : 19;
+        fillB[pi] = totalW ? bW / totalW : 50;
+        fillStdR[pi] = totalW ? Math.sqrt(Math.max(0, rSq / totalW - fillR[pi] ** 2)) : 4;
+        fillStdG[pi] = totalW ? Math.sqrt(Math.max(0, gSq / totalW - fillG[pi] ** 2)) : 4;
+        fillStdB[pi] = totalW ? Math.sqrt(Math.max(0, bSq / totalW - fillB[pi] ** 2)) : 4;
+      }
+    }
 
-    // Local standard deviation → realistic texture noise magnitude
-    const stdR = totalW ? Math.sqrt(Math.max(0, rSq / totalW - avgR * avgR)) : 4;
-    const stdG = totalW ? Math.sqrt(Math.max(0, gSq / totalW - avgG * avgG)) : 4;
-    const stdB = totalW ? Math.sqrt(Math.max(0, bSq / totalW - avgB * avgB)) : 4;
-
-    // Box-Muller Gaussian RNG — produces realistic pixel-level noise
+    // Box-Muller Gaussian noise — 0.7× std to reproduce texture without banding
     function gaussNoise(std) {
-      if (std < 0.5) return 0; // nearly-uniform region — don't add noise
+      if (std < 0.5) return 0;
       const u1 = Math.random(), u2 = Math.random();
-      return std * Math.sqrt(-2 * Math.log(u1 + 1e-10)) * Math.cos(2 * Math.PI * u2) * 0.45;
+      return std * Math.sqrt(-2 * Math.log(u1 + 1e-10)) * Math.cos(2 * Math.PI * u2) * 0.7;
     }
 
     for (let row = y; row < Math.min(H, y + bh); row++) {
       for (let col = x; col < Math.min(W, x + bw); col++) {
-        const i = (row * W + col) * 4;
-        data[i]     = clamp(avgR + gaussNoise(stdR));
-        data[i + 1] = clamp(avgG + gaussNoise(stdG));
-        data[i + 2] = clamp(avgB + gaussNoise(stdB));
+        const i  = (row * W + col) * 4;
+        const pi = (row - y) * bw + (col - x);
+        data[i]     = clamp(fillR[pi] + gaussNoise(fillStdR[pi]));
+        data[i + 1] = clamp(fillG[pi] + gaussNoise(fillStdG[pi]));
+        data[i + 2] = clamp(fillB[pi] + gaussNoise(fillStdB[pi]));
         data[i + 3] = 255;
       }
     }
