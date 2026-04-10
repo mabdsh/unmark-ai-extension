@@ -2,184 +2,119 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>UnmarkAI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="popup.css"/>
 </head>
 <body>
 
   <!-- ── Header ── -->
   <header class="header">
-    <div class="logo">
-      <svg class="logo-icon" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="18" cy="18" r="15" fill="url(#bg)" opacity="0.12"/>
-        <circle cx="18" cy="18" r="15" stroke="url(#g1)" stroke-width="1.2" opacity="0.5"/>
-        <path d="M18 7 L19.2 16.8 L28 18 L19.2 19.2 L18 29 L16.8 19.2 L8 18 L16.8 16.8 Z"
-              fill="url(#g1)" opacity="0.9"/>
-        <circle cx="18" cy="18" r="2" fill="#fff" opacity="0.6"/>
-        <defs>
-          <linearGradient id="g1" x1="8" y1="7" x2="28" y2="29" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#C4B5FD"/>
-            <stop offset="100%" stop-color="#6366F1"/>
-          </linearGradient>
-          <radialGradient id="bg" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stop-color="#8B5CF6"/>
-            <stop offset="100%" stop-color="#6366F1" stop-opacity="0"/>
-          </radialGradient>
-        </defs>
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="14" cy="14" r="12" fill="rgba(45,212,191,0.07)" stroke="rgba(45,212,191,0.18)" stroke-width="1"/>
+        <path d="M14 3.5L15.4 12.6L24 14L15.4 15.4L14 24.5L12.6 15.4L4 14L12.6 12.6Z"
+              fill="#2DD4BF"/>
+        <circle cx="14" cy="14" r="2" fill="white" opacity="0.55"/>
       </svg>
-      <div class="logo-text">
-        <span class="logo-title">UnmarkAI</span>
-        <span class="logo-sub">Gemini &amp; AI Studio · v3.3</span>
+      <div class="brand-copy">
+        <span class="brand-name">UnmarkAI</span>
+        <span class="brand-sub" id="statusLabel">Active on Gemini</span>
       </div>
     </div>
-    <label class="toggle" title="Enable / Disable">
-      <input type="checkbox" id="enabledCheckbox"/>
-      <span class="toggle-track"><span class="toggle-thumb"></span></span>
-    </label>
+    <div class="header-right">
+      <span class="pip" id="statusDot"></span>
+      <label class="master-sw" title="Enable / disable">
+        <input type="checkbox" id="enabledCheckbox"/>
+        <span class="ms-rail"><span class="ms-thumb"></span></span>
+      </label>
+    </div>
   </header>
 
-  <!-- ── Status bar ── -->
-  <div class="status-bar">
-    <span class="status-dot" id="statusDot"></span>
-    <span class="status-label" id="statusLabel">Active</span>
+  <!-- ── Stats ── -->
+  <div class="stats">
+    <div class="stat">
+      <span class="stat-n" id="statTotal">0</span>
+      <span class="stat-l">cleaned total</span>
+    </div>
+    <span class="stat-div"></span>
+    <div class="stat">
+      <span class="stat-n" id="statSession">0</span>
+      <span class="stat-l">this session</span>
+    </div>
   </div>
 
-  <!-- ── Stats ── -->
-  <section class="stats-row">
-    <div class="stat-card">
-      <span class="stat-value" id="statTotal">0</span>
-      <span class="stat-label">Total Removed</span>
-    </div>
-    <div class="stat-divider"></div>
-    <div class="stat-card">
-      <span class="stat-value" id="statSession">0</span>
-      <span class="stat-label">This Session</span>
-    </div>
-  </section>
-
-  <!-- ── Manual Scan ── -->
-  <section class="section scan-section">
-    <div class="section-header">
-      <div class="section-title">Manual Scan</div>
+  <!-- ── Scan ── -->
+  <section class="scan">
+    <div class="scan-row">
+      <span class="scan-hint" id="scanHint">Open a Gemini page to scan</span>
       <div class="scan-actions">
-        <!-- v3.3: Download All button (hidden until scan finds multiple images) -->
-        <button class="dl-all-btn" id="dlAllBtn" style="display:none;">↓ Clean All</button>
-        <button class="scan-btn" id="scanBtn">Scan Page</button>
+        <button class="btn-ghost" id="dlAllBtn" style="display:none">Clean all</button>
+        <button class="btn-primary" id="scanBtn">Scan page</button>
       </div>
     </div>
-    <div class="scan-hint" id="scanHint">Click "Scan Page" to find images on the current Gemini page</div>
-    <div class="image-grid" id="imageGrid" style="display:none;"></div>
+    <div class="img-grid" id="imageGrid" style="display:none"></div>
   </section>
 
   <!-- ── Settings ── -->
-  <section class="section">
-    <div class="section-title">Watermark Removal</div>
-    <label class="row-item">
-      <div class="row-label">
-        <span class="row-name">Remove Visible Watermark</span>
-        <span class="row-desc">Detects and erases the ✦ sparkle mark</span>
-      </div>
-      <label class="toggle sm">
-        <input type="checkbox" id="removeVisibleCheckbox"/>
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      </label>
-    </label>
-    <label class="row-item">
-      <div class="row-label">
-        <span class="row-name">Strip SynthID (Invisible)</span>
-        <span class="row-desc">Canvas re-encode destroys pixel-level mark</span>
-      </div>
-      <label class="toggle sm">
-        <input type="checkbox" id="removeSynthIDCheckbox"/>
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      </label>
-    </label>
-  </section>
+  <div class="settings">
 
-  <!-- ── Method ── -->
-  <section class="section">
-    <div class="section-title">Removal Method</div>
-    <div class="method-grid" id="methodGrid">
-      <button class="method-btn" data-method="smart">
-        <span class="method-icon">✦</span>
-        <span class="method-name">Smart</span>
-        <span class="method-desc">Blend fill · recommended</span>
-      </button>
-      <button class="method-btn" data-method="fill">
-        <span class="method-icon">▦</span>
-        <span class="method-name">Fill</span>
-        <span class="method-desc">Copy pixels above</span>
-      </button>
-      <button class="method-btn" data-method="crop">
-        <span class="method-icon">✂</span>
-        <span class="method-name">Crop</span>
-        <span class="method-desc">Trim image bottom 8%</span>
-      </button>
-      <button class="method-btn" data-method="strip">
-        <span class="method-icon">⟳</span>
-        <span class="method-name">Re-encode</span>
-        <span class="method-desc">SynthID strip only</span>
-      </button>
-    </div>
-  </section>
-
-  <!-- ── Format ── -->
-  <section class="section">
-    <div class="section-title">Output Format</div>
-    <div class="format-row">
-      <label class="format-opt">
-        <input type="radio" name="format" value="png" id="formatPng"/>
-        <span class="format-label">PNG <em>Lossless</em></span>
-      </label>
-      <label class="format-opt">
-        <input type="radio" name="format" value="jpeg" id="formatJpeg"/>
-        <span class="format-label">JPEG <em>Smaller file</em></span>
-      </label>
+    <div class="cfg-row">
+      <span class="cfg-label">Method</span>
+      <div class="seg-ctrl" id="methodGrid">
+        <button class="seg" data-method="smart">Smart</button>
+        <button class="seg" data-method="fill">Fill</button>
+        <button class="seg" data-method="crop">Crop</button>
+        <button class="seg" data-method="strip">Strip</button>
+      </div>
     </div>
 
-    <!-- v3.3: JPEG quality slider, hidden when PNG is selected -->
-    <div class="quality-row" id="qualityRow" style="display:none;">
-      <div class="quality-label-row">
-        <span class="quality-label">JPEG Quality</span>
-        <span class="quality-value" id="qualityValue">96%</span>
-      </div>
-      <input
-        type="range"
-        id="qualitySlider"
-        class="quality-slider"
-        min="50"
-        max="99"
-        step="1"
-        value="96"
-        aria-label="JPEG quality"
-      />
-      <div class="quality-hints">
-        <span>Smaller</span>
-        <span>Sharper</span>
+    <div class="cfg-row">
+      <span class="cfg-label">Format</span>
+      <div class="seg-ctrl">
+        <button class="seg format-seg" data-format="png">PNG</button>
+        <button class="seg format-seg" data-format="jpeg">JPEG</button>
       </div>
     </div>
-  </section>
 
-  <!-- ── Notifications ── -->
-  <section class="section">
-    <label class="row-item last">
-      <div class="row-label">
-        <span class="row-name">Toast Notifications</span>
-        <span class="row-desc">Show processing status on page</span>
+    <div class="quality-row" id="qualityRow" style="display:none">
+      <span class="cfg-label">Quality</span>
+      <div class="quality-ctrl">
+        <input type="range" class="q-range" id="qualitySlider"
+               min="50" max="99" step="1" value="96" aria-label="JPEG quality">
+        <span class="quality-val" id="qualityValue">96%</span>
       </div>
-      <label class="toggle sm">
-        <input type="checkbox" id="notifCheckbox"/>
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      </label>
-    </label>
-  </section>
+    </div>
+
+    <div class="rule"></div>
+
+    <div class="toggle-row">
+      <span class="toggle-label">Remove sparkle watermark</span>
+      <label class="sw"><input type="checkbox" id="removeVisibleCheckbox">
+        <span class="sw-rail"><span class="sw-thumb"></span></span></label>
+    </div>
+    <div class="toggle-row">
+      <span class="toggle-label">Strip SynthID fingerprint</span>
+      <label class="sw"><input type="checkbox" id="removeSynthIDCheckbox">
+        <span class="sw-rail"><span class="sw-thumb"></span></span></label>
+    </div>
+    <div class="toggle-row last">
+      <span class="toggle-label">Page notifications</span>
+      <label class="sw"><input type="checkbox" id="notifCheckbox">
+        <span class="sw-rail"><span class="sw-thumb"></span></span></label>
+    </div>
+
+  </div>
 
   <!-- ── Footer ── -->
   <footer class="footer">
-    <button class="reset-btn" id="resetBtn">Reset Stats</button>
-    <span class="version">UnmarkAI v3.3.0</span>
+    <button class="lnk-btn" id="resetBtn">Reset stats</button>
+    <span class="ver">v3.7.0</span>
   </footer>
+
+  <input type="radio" name="format" value="png"  id="formatPng"  style="display:none">
+  <input type="radio" name="format" value="jpeg" id="formatJpeg" style="display:none">
 
   <script src="popup.js"></script>
 </body>
