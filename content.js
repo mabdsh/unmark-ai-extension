@@ -77,10 +77,14 @@
   const processingUrls = new Set();
 
   // ── v3.5: Image data cache ─────────────────────────────────────────────────
-  // main-world.js sends GWR_BLOB(dataUrl) before GWR_INTERCEPT.
-  // We store the data URL string here; fetch(dataUrl) always works in content.js
-  // unlike fetch('blob:null/...') which Chrome blocks with a security error.
   const blobCache = new Map(); // blobUrl → data URL string or Blob
+
+  // ── Hover state — synced from main-world.js via GWR_HOVER ─────────────────
+  // Background.js's download fallback calls __UAI_processAndDownload(url) with
+  // no imgHint. We use the most recently hovered image-button src as the hint,
+  // since the user must hover an image before its download button appears.
+  let hoveredSrc  = null;
+  let hoveredTime = 0;
 
   // ── Message Bridge ─────────────────────────────────────────────────────────
   function installMessageBridge() {
@@ -90,11 +94,16 @@
 
       switch (e.data.gwrType) {
 
+        case 'GWR_HOVER': {
+          // main-world.js tells us which image the user is hovering over.
+          // We store it so background.js's fallback path can use it.
+          if (e.data.src) { hoveredSrc = e.data.src; hoveredTime = Date.now(); }
+          break;
+        }
+
         // v3.5: main-world now sends a pre-converted data URL string (not a Blob)
-        // so content.js never needs to fetch a blob: URL at all.
         case 'GWR_BLOB': {
           const { url, dataUrl, blob } = e.data;
-          // Accept either a data URL string (v3.5) or a Blob object (legacy)
           const cached = (typeof dataUrl === 'string' && dataUrl.startsWith('data:'))
             ? dataUrl
             : (blob instanceof Blob ? blob : null);
@@ -110,9 +119,7 @@
             window.postMessage({ gwrType: 'GWR_FALLBACK', url: e.data.url, filename: e.data.filename }, '*');
             return;
           }
-          // Notify background so fallback downloads.onCreated skips this URL
           chrome.runtime.sendMessage({ action: 'lockUrl', url: e.data.url }).catch(() => {});
-          // v3.5: pass imgHint through so fetchImage can use it for blob:null fallback
           await processIntercept(
             e.data.url,
             e.data.filename,
@@ -237,13 +244,25 @@
     }
 
     // ── Stages 6 & 7: page-image fallback ────────────────────────────────────
-    // The blob URL is inaccessible (blob:null / revoked). The same image is
-    // always rendered in a visible <img> tag on the Gemini page — use that
-    // HTTPS URL instead. This is identical to what manual scan does.
+    // The download URL is a blob:null (sandboxed iframe — inaccessible).
+    // Priority order for the fallback URL:
+    //   1. imgHint       — from GWR_INTERCEPT (only when main-world intercepted directly)
+    //   2. uaiClickedSrc — written to DOM by main-world's click listener at CLICK TIME
+    //                      via jslog rc_ cross-reference. Most reliable: written
+    //                      synchronously in the same event tick as the user's click,
+    //                      so scripting.executeScript always reads the correct image.
+    //   3. uaiHoveredSrc — written on image-button mouseover (5s window)
+    //   4. findBestPageImageUrl() — DOM scan (last resort, often latest image)
+    const clickedSrc  = document.documentElement.dataset.uaiClickedSrc  || null;
+    const clickedTime = parseInt(document.documentElement.dataset.uaiClickedTime || '0', 10);
+    // Use clicked hint within 10 seconds (generous window — click always precedes download)
+    const clickHint   = (clickedSrc && Date.now() - clickedTime < 10000) ? clickedSrc : null;
 
-    // Stage 6: imgHint sent by main-world (most targeted — found near the anchor)
-    // Stage 7: our own DOM scan (broader — same as __UAI_scanImages)
-    const fallbackUrl = imgHint || findBestPageImageUrl();
+    const domSrc      = document.documentElement.dataset.uaiHoveredSrc  || null;
+    const domTime     = parseInt(document.documentElement.dataset.uaiHoveredTime || '0', 10);
+    const recentHover = (domSrc && Date.now() - domTime < 10000) ? domSrc : null;
+
+    const fallbackUrl = imgHint || clickHint || recentHover || findBestPageImageUrl();
 
     if (!fallbackUrl) {
       throw new Error(
@@ -252,7 +271,15 @@
       );
     }
 
-    log('Stage 6/7: using page <img> fallback:', fallbackUrl.slice(0, 80));
+    log('Stage 6/7: using page <img> fallback:', fallbackUrl.slice(0, 80),
+        imgHint ? '(imgHint)' : clickHint ? '(click)' : recentHover ? '(hover)' : '(DOM scan)');
+
+    if (fallbackUrl.startsWith('blob:')) {
+      const r = await fetch(fallbackUrl);
+      if (!r.ok) throw new Error(`Blob fallback fetch failed: ${r.status}`);
+      return r.blob();
+    }
+
     const result = await chrome.runtime.sendMessage({ action: 'fetchImage', url: fallbackUrl });
     if (result?.error) throw new Error(`Fallback fetch failed: ${result.error}`);
     return new Blob([new Uint8Array(result.buffer)], {

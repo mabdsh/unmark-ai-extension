@@ -97,116 +97,149 @@
     return url;
   };
 
+  // ── Track which image the user is hovering ────────────────────────────────
+  // CORE INSIGHT: button.image-button — the large clickable wrapper around
+  // each generated image — is NEVER moved to a CDK portal. It always stays
+  // in its original overlay-container in the main DOM.
+  //
+  // Angular CDK TemplatePortal creates BRAND NEW DOM nodes for the overlay
+  // controls, so any annotation we put on the original download button node
+  // does NOT survive to the portal copy. Every DOM-walk and annotation
+  // approach fails for this reason.
+  //
+  // button.image-button is what triggers the hover state that shows the
+  // download controls. The user MUST move their cursor over it to reveal
+  // the download button. We record which image they hovered, and use a
+  // 5-second window so only the most recently hovered image is used.
+  let lastHoveredSrc  = null;
+  let lastHoveredTime = 0;
+
+  document.addEventListener('mouseover', (e) => {
+    const btn = e.target.closest?.('button.image-button');
+    if (!btn) return;
+    const img = btn.querySelector('img[src]');
+    if (!img?.src || img.src.startsWith('blob:null')) return;
+    if (!looksLikeGeminiImage(img.src)) return;
+    lastHoveredSrc  = img.src;
+    lastHoveredTime = Date.now();
+    log('Hovered image-button:', img.src.slice(0, 60));
+    // Write to the DOM so content.js can read it SYNCHRONOUSLY.
+    // window.postMessage is async and loses the race against background.js's
+    // downloads.onCreated fallback which calls __UAI_processAndDownload
+    // synchronously before the message event fires.
+    document.documentElement.dataset.uaiHoveredSrc  = img.src;
+    document.documentElement.dataset.uaiHoveredTime = Date.now().toString();
+    window.postMessage({ gwrType: 'GWR_HOVER', src: img.src }, '*');
+  }, true);
+
+  let pendingImageSrc = null;   // set by click listener, consumed by sendIntercept
+  let trustedClickX = 0, trustedClickY = 0;
+
+  // General click listener — capture coords and try jslog cross-reference
+  document.addEventListener('click', (e) => {
+    if (!e.isTrusted) return;
+    trustedClickX = e.clientX;
+    trustedClickY = e.clientY;
+
+    // jslog rc_ cross-reference: walk up from e.target looking for any
+    // element whose jslog contains a Gemini rc_ candidate ID, then find
+    // the single-image element in the main DOM that shares that ID.
+    let el = e.target;
+    for (let d = 0; d < 15; d++) {
+      if (!el || el === document.documentElement) break;
+      const jslog = el.getAttribute?.('jslog') || '';
+      const m = jslog.match(/"(rc_[a-f0-9]+)"/);
+      if (m) {
+        const si = document.querySelector(`single-image[jslog*="${m[1]}"]`);
+        const img = si?.querySelector('img[src]');
+        if (img?.src && !img.src.startsWith('blob:null') && looksLikeGeminiImage(img.src)) {
+          pendingImageSrc = img.src;
+          // Write to DOM synchronously — content.js reads this at Stage 6/7
+          // even when background.js's scripting.executeScript runs later.
+          document.documentElement.dataset.uaiClickedSrc  = img.src;
+          document.documentElement.dataset.uaiClickedTime = Date.now().toString();
+          log('jslog rc_ hit:', m[1], '→', img.src.slice(0, 60));
+          return;
+        }
+      }
+      el = el.parentElement;
+    }
+    // jslog failed — coords fallback and hover-based fallback remain available
+  }, true);
+
   // ── Capture real user clicks on download anchor elements ─────────────────
-  // The .click() override and dispatchEvent override only intercept PROGRAMMATIC
-  // clicks from JavaScript code. A real user mouse-click on an <a download> link
-  // goes through the browser's native input handler, which dispatches the click
-  // event internally at the C++ level — it never calls JS prototype methods.
-  //
-  // Without this listener, the flow is:
-  //   user click → browser follows href → Chrome creates download → onCreated
-  //   → our cancel races the file write (and loses for fast blob downloads)
-  //   → original watermarked file saved BEFORE we can stop it
-  //
-  // With capture=true this fires BEFORE Angular/React handlers and before the
-  // browser follows the link. e.preventDefault() stops the native download.
   document.addEventListener('click', function uaiCaptureClick(e) {
     if (!enabled) return;
-
-    // Walk up from the clicked element to find the nearest <a>
     const anchor = e.target.closest('a');
     if (!anchor || anchor._uaiDone) return;
-
     const href = anchor.href;
     if (!href || !looksLikeGeminiImage(href)) return;
-
-    // Only intercept anchors that are intended as downloads (have download attr)
-    // to avoid breaking normal image navigation links
     if (!anchor.hasAttribute('download')) return;
-
     e.preventDefault();
-    e.stopImmediatePropagation(); // prevent Angular from also triggering a download
-
+    e.stopImmediatePropagation();
     const filename = anchor.getAttribute('download') || guessFilename(href);
     log('Intercepted real user click on', href.slice(0, 70));
     sendIntercept(href, filename);
-  }, true /* capture phase */);
+  }, true);
 
   // ── Override: programmatic .click() on anchor elements ──────────────────
-  // ROOT CAUSE FIX v3.4: removed `!this.hasAttribute('download')` guard.
-  // Gemini creates plain <a href="..."> without a download attribute, which
-  // caused all three interception paths to silently pass through before.
   HTMLAnchorElement.prototype.click = function () {
-    if (this._uaiDone || !enabled) {
-      return _origClick.apply(this, arguments);
-    }
+    if (this._uaiDone || !enabled) return _origClick.apply(this, arguments);
     const href = this.href;
-    if (!looksLikeGeminiImage(href)) {
-      return _origClick.apply(this, arguments);
-    }
+    if (!looksLikeGeminiImage(href)) return _origClick.apply(this, arguments);
     log('Intercepted .click() on', href.slice(0, 70));
-    // Use download attr if present, otherwise guess from URL
     sendIntercept(href, this.getAttribute('download') || guessFilename(href));
-    // Do NOT call _origClick — we handle the download ourselves
   };
 
   // ── Override: dispatchEvent (catches React/Angular synthetic clicks) ─────
-  // ROOT CAUSE FIX v3.4: removed `this.hasAttribute('download')` guard.
   EventTarget.prototype.dispatchEvent = function (event) {
     if (
-      enabled &&
-      !this._uaiDone &&
+      enabled && !this._uaiDone &&
       this instanceof HTMLAnchorElement &&
-      event instanceof MouseEvent &&
-      event.type === 'click' &&
+      event instanceof MouseEvent && event.type === 'click' &&
       looksLikeGeminiImage(this.href)
     ) {
       log('Intercepted dispatchEvent click on', this.href.slice(0, 70));
       sendIntercept(this.href, this.getAttribute('download') || guessFilename(this.href));
-      return true; // pretend event fired normally
+      return true;
     }
     return _origDispatch.apply(this, arguments);
   };
 
   // ── MutationObserver: catch "append → click → remove" anchor pattern ─────
-  // Angular often creates a temporary <a> in the DOM, clicks it, then removes it.
-  // ROOT CAUSE FIX v3.4: removed `!node.hasAttribute('download')` guard.
   new MutationObserver((mutations) => {
     if (!enabled) return;
     for (const m of mutations) {
       for (const node of m.addedNodes) {
-        if (!(node instanceof HTMLAnchorElement)) continue;
-        if (node._uaiDone) continue;
+        if (!(node instanceof HTMLAnchorElement) || node._uaiDone) continue;
         if (!looksLikeGeminiImage(node.href)) continue;
-
         node.addEventListener('click', function captureHandler(e) {
           e.preventDefault();
           e.stopImmediatePropagation();
           node.removeEventListener('click', captureHandler, true);
           log('Intercepted MutationObserver click on', node.href.slice(0, 70));
           sendIntercept(node.href, node.getAttribute('download') || guessFilename(node.href));
-        }, true /* capture phase — fires before Angular handlers */);
+        }, true);
       }
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
-  // v3.5 FIX: sendIntercept is now async.
-  //
-  // For blobs we captured via our URL.createObjectURL override (main-frame blobs):
-  //   FileReader converts them to a data URL HERE in the main world, then sends
-  //   GWR_BLOB(dataUrl). Content.js receives a plain string it can fetch() directly
-  //   — no blob: scheme needed, no Chrome security restriction.
-  //
-  // For blob:null blobs (sandboxed iframe — we never captured them):
-  //   We walk the DOM for a large <img> pointing to the same image via an HTTPS URL
-  //   and pass it as imgHint. Content.js uses this as the authoritative fallback.
   async function sendIntercept(url, filename) {
     const blob = blobMap.get(url);
 
+    // Priority 1: jslog rc_ cross-reference from click (most precise)
+    // Priority 2: last hovered image-button within 5 seconds (reliable — never in portal)
+    // Priority 3: bounding-rect check against click coordinates
+    // Priority 4: last Gemini image in DOM (last resort)
+    const recentHover = (Date.now() - lastHoveredTime < 5000) ? lastHoveredSrc : null;
+    const imgHint = pendingImageSrc || recentHover || findImageByCoords() || findNearestGeminiImageUrl();
+    pendingImageSrc = null;
+    log('imgHint:', imgHint ? imgHint.slice(0, 80) : 'none',
+        '| hover age:', Math.round((Date.now() - lastHoveredTime) / 1000) + 's');
+
     if (blob) {
-      // Convert to data URL inside the main world — content.js can always fetch these
       try {
         const dataUrl = await blobToDataUrl(blob);
         window.postMessage({ gwrType: 'GWR_BLOB', url, dataUrl }, '*');
@@ -215,33 +248,37 @@
       }
     }
 
-    // Always look for a nearby HTTPS image URL as a fallback for blob:null downloads
-    const imgHint = findNearestGeminiImageUrl();
-
-    window.postMessage({
-      gwrType:  'GWR_INTERCEPT',
-      url,
-      filename,
-      hasBlob:  !!blob,
-      imgHint,  // may be null if no accessible image found
-    }, '*');
+    window.postMessage({ gwrType: 'GWR_INTERCEPT', url, filename, hasBlob: !!blob, imgHint }, '*');
   }
 
-  // Convert a Blob to a data URL using FileReader (main-world has full access)
-  function blobToDataUrl(blob) {
-    return new Promise((resolve, reject) => {
-      const reader   = new FileReader();
-      reader.onload  = () => resolve(reader.result);
-      reader.onerror = () => reject(new Error('FileReader failed'));
-      reader.readAsDataURL(blob);
-    });
+  // Bounding-rect fallback: find the Gemini image whose screen rect contains
+  // the trusted click coordinates. The download controls are visually positioned
+  // over the image so the click point should be within the image's bounds.
+  function findImageByCoords() {
+    const imgs = Array.from(document.querySelectorAll('img[src]'))
+      .filter(i => i.naturalWidth >= 256 && i.naturalHeight >= 256)
+      .filter(i => !i.src.startsWith('blob:null') && looksLikeGeminiImage(i.src));
+    if (imgs.length <= 1) return imgs[0]?.src ?? null;
+
+    const x = trustedClickX, y = trustedClickY;
+    for (const img of imgs) {
+      const r = img.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return img.src;
+    }
+    // closest center fallback
+    let best = null, bestD = Infinity;
+    for (const img of imgs) {
+      const r = img.getBoundingClientRect();
+      const d = (x - r.left - r.width/2)**2 + (y - r.top - r.height/2)**2;
+      if (d < bestD) { bestD = d; best = img; }
+    }
+    return best?.src ?? null;
   }
 
-  // Walk the DOM for large Gemini-generated images — same URL patterns as
-  // __UAI_scanImages so imgHint always matches what manual scan can find.
-  //
-  // v3.6 FIX: only skip blob:null. blob:https://gemini.google.com/uuid are
-  // same-origin blobs (accessible) and are what Gemini uses for <img src>.
+
+
+  // Fallback page scan — used when lastHoveredImageSrc is null.
+  // Returns the last large Gemini image in DOM order.
   function findNearestGeminiImageUrl() {
     const imgs = Array.from(document.querySelectorAll('img[src]'));
     for (let i = imgs.length - 1; i >= 0; i--) {
