@@ -516,78 +516,78 @@
       return;
     }
 
-    // ── SMART: per-pixel inverse-distance-weighted fill ───────────────────────
-    // Use a generous sampling pad — at least 3× the patch size so edge regions
-    // (where the image boundary truncates one side of the ring) still gather
-    // enough valid pixels to compute an accurate local colour estimate.
-    const basePad   = Math.max(32, Math.round(Math.min(W, H) * 0.035));
-    // Extra padding for corner/edge regions where the ring is partially missing
-    const atRight   = (x + bw >= W - 8);
-    const atBottom  = (y + bh >= H - 8);
-    const extraPad  = (atRight || atBottom) ? basePad : 0;
-    const samplePad = basePad + extraPad;
+    // ── SMART: background-interpolation anomaly removal ───────────────────────
+    // Instead of guessing which pixels ARE the sparkle by colour (fragile —
+    // the sparkle can be white, lavender, or any colour depending on rendering),
+    // we estimate what the background SHOULD look like by interpolating from
+    // pixels just outside the detected region, then replace only pixels that
+    // differ significantly from that estimate (= the sparkle pixels).
+    //
+    // This works perfectly for:
+    //   • Gradients — the border pixels define the gradient; IDW continues it
+    //   • Solid colours — every interior pixel gets the correct background value
+    //   • Any sparkle colour — we detect by deviation, not by hue
+    //   • Corner regions — only the available left/top border matters
 
-    const sx1 = Math.max(0, x - samplePad);
-    const sy1 = Math.max(0, y - samplePad);
-    const sx2 = Math.min(W, x + bw + samplePad);
-    const sy2 = Math.min(H, y + bh + samplePad);
-
-    // Compute per-pixel fill using IDW from the sampling ring so each pixel
-    // gets a local estimate rather than a single global average for the whole
-    // patch (which is what causes the flat-colour look in large regions).
-    const fillR = new Float32Array(bw * bh);
-    const fillG = new Float32Array(bw * bh);
-    const fillB = new Float32Array(bw * bh);
-    const fillStdR = new Float32Array(bw * bh);
-    const fillStdG = new Float32Array(bw * bh);
-    const fillStdB = new Float32Array(bw * bh);
-
-    // Collect ring samples once
-    const ringPx = [];
-    for (let sy = sy1; sy < sy2; sy++) {
-      for (let sx = sx1; sx < sx2; sx++) {
-        if (sx >= x && sx < x + bw && sy >= y && sy < y + bh) continue;
-        const i = (sy * W + sx) * 4;
-        ringPx.push({ r: data[i], g: data[i+1], b: data[i+2], sx, sy });
+    // Collect border pixels just outside the bounding box (skip missing edges)
+    const bgSamples = [];
+    const BG_STEP = 5; // sample every 5px along each border side
+    for (let bx = x; bx < x + bw; bx += BG_STEP) {
+      if (y > 0) {
+        const i = ((y - 1) * W + Math.max(0, Math.min(W - 1, bx))) * 4;
+        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: y - 1 });
+      }
+      if (y + bh < H) {
+        const i = ((y + bh) * W + Math.max(0, Math.min(W - 1, bx))) * 4;
+        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: y + bh });
+      }
+    }
+    for (let by = y; by < y + bh; by += BG_STEP) {
+      if (x > 0) {
+        const i = (Math.max(0, Math.min(H - 1, by)) * W + (x - 1)) * 4;
+        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: x - 1, sy: by });
+      }
+      if (x + bw < W) {
+        const i = (Math.max(0, Math.min(H - 1, by)) * W + (x + bw)) * 4;
+        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: x + bw, sy: by });
       }
     }
 
-    // For each pixel in the patch, IDW-weight the ring samples by distance
+    // If the region is entirely at the image corner and all 4 borders are
+    // missing — sample a wider ring so we always have something to interpolate from
+    if (bgSamples.length < 4) {
+      const pad = 15;
+      for (let bx = Math.max(0, x - pad); bx < Math.min(W, x + bw + pad); bx += BG_STEP) {
+        for (let by = Math.max(0, y - pad); by < Math.min(H, y + bh + pad); by += BG_STEP) {
+          if (bx >= x && bx < x + bw && by >= y && by < y + bh) continue;
+          const i = (by * W + bx) * 4;
+          bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: by });
+        }
+      }
+    }
+
+    // For each pixel in the region: IDW estimate of background, replace if anomalous
+    // Threshold: mean absolute deviation across 3 channels > 15 units
+    const THRESHOLD = 15;
     for (let row = y; row < Math.min(H, y + bh); row++) {
       for (let col = x; col < Math.min(W, x + bw); col++) {
-        let rW = 0, gW = 0, bW = 0, rSq = 0, gSq = 0, bSq = 0, totalW = 0;
-        for (const p of ringPx) {
+        let sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+        for (const p of bgSamples) {
           const dx = p.sx - col, dy = p.sy - row;
           const w  = 1 / (dx * dx + dy * dy + 0.25);
-          rW += p.r * w; gW += p.g * w; bW += p.b * w;
-          rSq += p.r * p.r * w; gSq += p.g * p.g * w; bSq += p.b * p.b * w;
-          totalW += w;
+          sumR += p.r * w; sumG += p.g * w; sumB += p.b * w; sumW += w;
         }
-        const pi = (row - y) * bw + (col - x);
-        fillR[pi] = totalW ? rW / totalW : 18;
-        fillG[pi] = totalW ? gW / totalW : 19;
-        fillB[pi] = totalW ? bW / totalW : 50;
-        fillStdR[pi] = totalW ? Math.sqrt(Math.max(0, rSq / totalW - fillR[pi] ** 2)) : 4;
-        fillStdG[pi] = totalW ? Math.sqrt(Math.max(0, gSq / totalW - fillG[pi] ** 2)) : 4;
-        fillStdB[pi] = totalW ? Math.sqrt(Math.max(0, bSq / totalW - fillB[pi] ** 2)) : 4;
-      }
-    }
-
-    // Box-Muller Gaussian noise — 0.7× std to reproduce texture without banding
-    function gaussNoise(std) {
-      if (std < 0.5) return 0;
-      const u1 = Math.random(), u2 = Math.random();
-      return std * Math.sqrt(-2 * Math.log(u1 + 1e-10)) * Math.cos(2 * Math.PI * u2) * 0.7;
-    }
-
-    for (let row = y; row < Math.min(H, y + bh); row++) {
-      for (let col = x; col < Math.min(W, x + bw); col++) {
-        const i  = (row * W + col) * 4;
-        const pi = (row - y) * bw + (col - x);
-        data[i]     = clamp(fillR[pi] + gaussNoise(fillStdR[pi]));
-        data[i + 1] = clamp(fillG[pi] + gaussNoise(fillStdG[pi]));
-        data[i + 2] = clamp(fillB[pi] + gaussNoise(fillStdB[pi]));
-        data[i + 3] = 255;
+        if (!sumW) continue;
+        const er = sumR / sumW, eg = sumG / sumW, eb = sumB / sumW;
+        const ci  = (row * W + col) * 4;
+        const diff = (Math.abs(data[ci] - er) + Math.abs(data[ci+1] - eg) + Math.abs(data[ci+2] - eb)) / 3;
+        if (diff > THRESHOLD) {
+          data[ci]     = clamp(er);
+          data[ci + 1] = clamp(eg);
+          data[ci + 2] = clamp(eb);
+          data[ci + 3] = 255;
+        }
+        // pixel matches background → left completely untouched ✓
       }
     }
   }
