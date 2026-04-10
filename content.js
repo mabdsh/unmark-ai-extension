@@ -261,57 +261,98 @@
   }
 
   // Scan the DOM for large Gemini-generated images.
-  // Uses the SAME URL patterns as __UAI_scanImages so it always matches
-  // whatever __UAI_scanImages finds (manual scan = direct download = same logic).
-  //
-  // v3.6 FIX: only skip blob:null (sandboxed-iframe, truly inaccessible).
-  // blob:https://gemini.google.com/uuid are same-origin blobs — content scripts
-  // CAN fetch them (Stage 4), and they're what Gemini uses for <img src>.
-  // The old "skip all blob:" was why the fallback always returned null.
+  // v3.7 quality fix:
+  //   • Collect ALL matching candidates and return the one with the LARGEST pixel
+  //     area (naturalWidth × naturalHeight) instead of the last in DOM order.
+  //     Gemini pages often have thumbnails alongside full-size images; the largest
+  //     is always the correct source.
+  //   • Apply maximizeUrlQuality() to CDN URLs to remove size constraints before
+  //     fetching, so the background service worker gets the original-resolution image.
   function findBestPageImageUrl() {
+    const candidates = [];
     const imgs = Array.from(document.querySelectorAll('img[src]'));
-    for (let i = imgs.length - 1; i >= 0; i--) {
-      const img = imgs[i];
+
+    for (const img of imgs) {
       if (img.naturalWidth < 256 || img.naturalHeight < 256) continue;
       const { src } = img;
 
-      // Only skip null-origin blobs — same-origin blobs ARE fetchable
+      // Only skip null-origin blobs (sandboxed iframe — truly inaccessible)
       if (src.startsWith('blob:null')) continue;
 
-      // Same-origin blob: URL (blob:https://gemini.google.com/...) — accept
-      if (src.startsWith('blob:')) return src;
-
-      // Known Gemini HTTPS image domains
-      if (
+      const isMatch =
+        src.startsWith('blob:') ||                                // same-origin blob
         src.includes('googleusercontent.com') ||
         src.includes('generativelanguage.googleapis.com') ||
         src.includes('storage.googleapis.com') ||
-        src.includes('generatedimage')
-      ) return src;
+        src.includes('generatedimage') ||
+        (() => { try { return /\.(png|jpe?g|webp)(\?|$)/i.test(new URL(src, location.href).pathname); } catch { return false; } })();
 
-      // Broad fallback: any URL with a recognised image extension
-      try {
-        const path = new URL(src, location.href).pathname;
-        if (/\.(png|jpe?g|webp)(\?|$)/i.test(path)) return src;
-      } catch {}
+      if (!isMatch) continue;
+
+      candidates.push({
+        src:  maximizeUrlQuality(src),
+        area: img.naturalWidth * img.naturalHeight,
+      });
     }
-    return null;
+
+    if (!candidates.length) return null;
+    // Sort descending by pixel area — pick the highest-resolution source
+    candidates.sort((a, b) => b.area - a.area);
+    return candidates[0].src;
+  }
+
+  // Remove or replace size-constraint parameters from Google CDN URLs so we
+  // fetch the full-resolution original instead of a display-optimized thumbnail.
+  //
+  // googleusercontent.com / lh*.googleusercontent.com URL format:
+  //   https://lh3.googleusercontent.com/[hash]=[params]
+  //   params examples: s1024  w800-h600  w512-h512-c  rw-v1
+  //   s0 = "original size" (no downscaling)
+  function maximizeUrlQuality(url) {
+    if (!url || url.startsWith('blob:')) return url;
+    try {
+      // Google image CDN (lh1–lh9, plus generic googleusercontent)
+      if (/lh\d*\.googleusercontent\.com/.test(url) || url.includes('googleusercontent.com/a/')) {
+        // The size spec follows a '=' that appears after the base64 image ID
+        // Replace everything from the last '=' onwards with '=s0'
+        const eqIdx = url.lastIndexOf('=');
+        const slashIdx = url.lastIndexOf('/');
+        if (eqIdx > slashIdx && eqIdx > 0) {
+          return url.slice(0, eqIdx) + '=s0';
+        }
+      }
+    } catch {}
+    return url;
   }
 
   // ── Image Processing Pipeline ──────────────────────────────────────────────
   async function processImage(blob) {
     let bitmap;
     try {
-      bitmap = await createImageBitmap(blob);
-    } catch (err) {
-      throw new Error(`Could not decode image: ${err.message}`);
+      // colorSpaceConversion:'none' keeps the raw pixel values from the decoder
+      // so the canvas (Display P3) receives them without a double conversion.
+      bitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none' });
+    } catch {
+      // Older Chrome: fall back to default decode
+      try { bitmap = await createImageBitmap(blob); }
+      catch (err) { throw new Error(`Could not decode image: ${err.message}`); }
     }
 
     const W = bitmap.width, H = bitmap.height;
     log('Processing', W, '×', H, '| method:', cfg.method, '| format:', cfg.format);
 
     const canvas = document.createElement('canvas');
-    const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+    // ── Quality fix: use Display P3 color space ───────────────────────────────
+    // Canvas defaults to sRGB, which clips wide-gamut (Display P3) colors that
+    // Gemini AI images commonly contain. Using 'display-p3' preserves those
+    // colors and embeds the correct ICC profile in the output PNG.
+    const p3Supported = (typeof CanvasRenderingContext2D !== 'undefined');
+    const ctx = canvas.getContext('2d', {
+      willReadFrequently: true,
+      colorSpace: p3Supported ? 'display-p3' : 'srgb',
+    });
+    // No interpolation — pixels must map 1-to-1 to avoid softening
+    ctx.imageSmoothingEnabled = false;
 
     // ── CROP: trim bottom 8 % ─────────────────────────────────────────────
     if (cfg.method === 'crop') {
@@ -334,7 +375,6 @@
     }
 
     const mime = cfg.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-    // v3.3: use configurable quality; fallback to 0.96
     const qual = cfg.format === 'jpeg' ? (cfg.jpegQuality ?? 0.96) : undefined;
 
     return new Promise((res, rej) =>

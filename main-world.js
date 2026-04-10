@@ -237,37 +237,49 @@
     });
   }
 
-  // Walk the DOM for large Gemini-generated images — same URL patterns as
-  // __UAI_scanImages so imgHint always matches what manual scan can find.
-  //
-  // v3.6 FIX: only skip blob:null. blob:https://gemini.google.com/uuid are
-  // same-origin blobs (accessible) and are what Gemini uses for <img src>.
+  // Walk the DOM for large Gemini-generated images.
+  // v3.7: collect all candidates, return the LARGEST by pixel area so we always
+  // process the highest-resolution source. Apply maximizeUrlQuality() to remove
+  // CDN size constraints from googleusercontent.com URLs.
   function findNearestGeminiImageUrl() {
+    const candidates = [];
     const imgs = Array.from(document.querySelectorAll('img[src]'));
-    for (let i = imgs.length - 1; i >= 0; i--) {
-      const img = imgs[i];
+
+    for (const img of imgs) {
       if (img.naturalWidth < 256 || img.naturalHeight < 256) continue;
       const { src } = img;
-
-      // Only skip null-origin blobs (sandboxed iframe — truly inaccessible)
       if (src.startsWith('blob:null')) continue;
 
-      // Same-origin blob (blob:https://gemini.google.com/...) — accept
-      if (src.startsWith('blob:')) return src;
-
-      if (
+      const isMatch =
+        src.startsWith('blob:') ||
         src.includes('googleusercontent.com') ||
         src.includes('generativelanguage.googleapis.com') ||
         src.includes('storage.googleapis.com') ||
-        src.includes('generatedimage')
-      ) return src;
+        src.includes('generatedimage') ||
+        (() => { try { return /\.(png|jpe?g|webp)(\?|$)/i.test(new URL(src).pathname); } catch { return false; } })();
 
-      try {
-        const path = new URL(src).pathname;
-        if (/\.(png|jpe?g|webp)(\?|$)/i.test(path)) return src;
-      } catch {}
+      if (!isMatch) continue;
+      candidates.push({ src: maximizeUrlQuality(src), area: img.naturalWidth * img.naturalHeight });
     }
-    return null;
+
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.area - a.area);
+    return candidates[0].src;
+  }
+
+  // Remove size-constraint parameters from Google CDN URLs.
+  // lh3.googleusercontent.com pattern: [base64hash]=[size_params]
+  // Replacing with =s0 requests the original unscaled image.
+  function maximizeUrlQuality(url) {
+    if (!url || url.startsWith('blob:')) return url;
+    try {
+      if (/lh\d*\.googleusercontent\.com/.test(url) || url.includes('googleusercontent.com/a/')) {
+        const eqIdx = url.lastIndexOf('=');
+        const slashIdx = url.lastIndexOf('/');
+        if (eqIdx > slashIdx && eqIdx > 0) return url.slice(0, eqIdx) + '=s0';
+      }
+    } catch {}
+    return url;
   }
 
   function doDownload(urlOrData, filename) {
