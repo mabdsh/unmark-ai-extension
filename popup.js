@@ -1,5 +1,12 @@
 /**
- * UnmarkAI v3.7 — Popup Script
+ * UnmarkAI v3.8 — Popup Script
+ *
+ * v3.8 additions:
+ *   • autoIntercept mode (Auto/Manual segmented control)
+ *   • AI method button (distinct from the segmented method control)
+ *   • AI model status bar (not loaded / loading / ready / error)
+ *   • Clear model cache button
+ *   • synthIdHint text updated to reflect new noise+JPEG approach
  */
 'use strict';
 
@@ -14,6 +21,7 @@ const statusDot       = $('statusDot');
 const statusLabel     = $('statusLabel');
 const statTotal       = $('statTotal');
 const statSession     = $('statSession');
+const statMode        = $('statMode');
 const qualitySlider   = $('qualitySlider');
 const qualityValue    = $('qualityValue');
 const resetBtn        = $('resetBtn');
@@ -22,17 +30,28 @@ const dlAllBtn        = $('dlAllBtn');
 const imageGrid       = $('imageGrid');
 const scanHint        = $('scanHint');
 const qualityRow      = $('qualityRow');
+const modeCard        = $('modeCard');
+const modeTitle       = $('modeTitle');
+const modeDesc        = $('modeDesc');
+const modeIconAuto    = $('modeIconAuto');
+const modeIconManual  = $('modeIconManual');
+const scanSection     = $('scanSection');
+const aiMethodBtn     = $('aiMethodBtn');
+const aiStatusBar     = $('aiStatusBar');
+const aiStatusDot     = $('aiStatusDot');
+const aiStatusText    = $('aiStatusText');
+const aiClearCacheBtn = $('aiClearCacheBtn');
 
-// Segmented control buttons
-const methodBtns  = document.querySelectorAll('#methodGrid .seg');
-const formatBtns  = document.querySelectorAll('.format-seg');
+const methodBtns = document.querySelectorAll('#methodGrid .seg');
+const formatBtns = document.querySelectorAll('.format-seg');
+const modeSegs   = document.querySelectorAll('.mode-seg');
 
-// Hidden radio inputs (kept for storage compat)
-const formatPng   = $('formatPng');
-const formatJpeg  = $('formatJpeg');
+const formatPng  = $('formatPng');
+const formatJpeg = $('formatJpeg');
 
 let cfg = {
   enabled:           true,
+  autoIntercept:     true,
   removeVisible:     true,
   removeSynthID:     true,
   method:            'smart',
@@ -63,10 +82,17 @@ function renderCfg() {
   document.body.classList.toggle('paused', !cfg.enabled);
   setStatus(cfg.enabled);
 
-  // Method segmented control
+  // Classic method segmented buttons
   methodBtns.forEach(b => b.classList.toggle('active', b.dataset.method === cfg.method));
 
-  // Format segmented control
+  // AI method button — active state is independent from seg-ctrl
+  const isAiMethod = cfg.method === 'ai';
+  aiMethodBtn.classList.toggle('active', isAiMethod);
+  // Deactivate all seg buttons if AI is selected
+  if (isAiMethod) methodBtns.forEach(b => b.classList.remove('active'));
+  document.body.classList.toggle('ai-method', isAiMethod);
+
+  // Format
   formatBtns.forEach(b => b.classList.toggle('active', b.dataset.format === cfg.format));
   if (formatPng)  formatPng.checked  = cfg.format === 'png';
   if (formatJpeg) formatJpeg.checked = cfg.format === 'jpeg';
@@ -76,6 +102,12 @@ function renderCfg() {
   if (qualitySlider) qualitySlider.value = q;
   if (qualityValue)  qualityValue.textContent = q + '%';
   updateQualityVisibility();
+
+  // AI status bar
+  updateAiStatusBar(isAiMethod);
+
+  // Mode
+  renderMode();
 }
 
 function renderStats(stats, session) {
@@ -86,6 +118,81 @@ function renderStats(stats, session) {
 function setStatus(on) {
   statusDot.classList.toggle('off', !on);
   statusLabel.textContent = on ? 'Active on Gemini' : 'Paused';
+}
+
+// ── AI status bar ──────────────────────────────────────────────────────────
+// We probe the active Gemini tab to check whether the LaMa worker is warm.
+async function updateAiStatusBar(show) {
+  if (!show) {
+    aiStatusBar.style.display = 'none';
+    return;
+  }
+  aiStatusBar.style.display = 'flex';
+
+  // Probe the Gemini tab for worker readiness
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) { setAiStatus('idle', 'Open a Gemini page first'); return; }
+
+    const isGemini = tab.url?.includes('gemini.google.com') ||
+                     tab.url?.includes('aistudio.google.com');
+    if (!isGemini) { setAiStatus('idle', 'LaMa model will load on first Gemini download'); return; }
+
+    // Ask content.js if the worker already exists (worker is alive if lamaWorker !== null)
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => ({
+        workerAlive:  typeof window.__UAI_clearLamaCache === 'function',
+        // We can't directly check lamaReady from popup, but we can check the function exists
+      }),
+    }).catch(() => null);
+
+    const workerAlive = results?.[0]?.result?.workerAlive;
+    if (workerAlive) {
+      setAiStatus('ready', 'LaMa model ready — AI inpainting active');
+    } else {
+      setAiStatus('idle', 'LaMa model not loaded — will download on first use (~20 MB)');
+    }
+  } catch {
+    setAiStatus('idle', 'LaMa model will load on first use (~20 MB)');
+  }
+}
+
+function setAiStatus(state, text) {
+  aiStatusDot.className = 'ai-status-dot' + (state !== 'idle' ? ' ' + state : '');
+  aiStatusText.className = 'ai-status-text' + (state === 'ready' ? ' highlight' : '');
+  aiStatusText.textContent = text;
+}
+
+// ── Mode rendering ──────────────────────────────────────────────────────────
+const MODE_CONFIG = {
+  auto:   { title: 'Auto Intercept', desc: 'Downloads are cleaned automatically when you click ↓ in Gemini', stat: 'AUTO' },
+  manual: { title: 'Manual Mode',    desc: 'Use Scan page below to find and clean images yourself',          stat: 'MANUAL' },
+};
+
+function renderMode() {
+  const isAuto = cfg.autoIntercept !== false;
+  const mode   = isAuto ? 'auto' : 'manual';
+  const mc     = MODE_CONFIG[mode];
+
+  modeSegs.forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  modeTitle.textContent = mc.title;
+  modeDesc.textContent  = mc.desc;
+  modeCard.classList.toggle('manual-active', !isAuto);
+
+  modeIconAuto.style.display   = isAuto ? '' : 'none';
+  modeIconManual.style.display = isAuto ? 'none' : '';
+
+  statMode.textContent = mc.stat;
+  statMode.classList.toggle('manual', !isAuto);
+
+  scanSection.classList.toggle('manual-highlight', !isAuto);
+
+  if (!isAuto && scanHint.textContent.includes('Open')) {
+    scanHint.textContent = 'Manual mode — scan this Gemini page to find images';
+  } else if (isAuto && scanHint.textContent.includes('Manual mode')) {
+    scanHint.textContent = 'Open a Gemini page to scan for images';
+  }
 }
 
 function updateQualityVisibility() {
@@ -111,11 +218,32 @@ removeVisibleCb.addEventListener('change', () => { cfg.removeVisible = removeVis
 removeSynthIDCb.addEventListener('change', () => { cfg.removeSynthID = removeSynthIDCb.checked; save(); });
 notifCb.addEventListener('change', () => { cfg.showNotifications = notifCb.checked; save(); });
 
-// Method segmented control
+// Classic method segmented buttons
 methodBtns.forEach(btn => btn.addEventListener('click', () => {
   cfg.method = btn.dataset.method;
   methodBtns.forEach(b => b.classList.toggle('active', b === btn));
+  aiMethodBtn.classList.remove('active');
+  document.body.classList.remove('ai-method');
+  aiStatusBar.style.display = 'none';
   save();
+}));
+
+// AI method button
+aiMethodBtn.addEventListener('click', () => {
+  cfg.method = 'ai';
+  methodBtns.forEach(b => b.classList.remove('active'));
+  aiMethodBtn.classList.add('active');
+  document.body.classList.add('ai-method');
+  updateAiStatusBar(true);
+  save();
+});
+
+// Mode segmented control
+modeSegs.forEach(btn => btn.addEventListener('click', () => {
+  cfg.autoIntercept = btn.dataset.mode === 'auto';
+  save();
+  renderMode();
+  chrome.runtime.sendMessage({ action: 'setAutoIntercept', autoIntercept: cfg.autoIntercept }).catch(() => {});
 }));
 
 // Format segmented control
@@ -144,6 +272,27 @@ resetBtn.addEventListener('click', async () => {
   bump(statTotal);
 });
 
+// Clear LaMa model cache
+aiClearCacheBtn.addEventListener('click', async () => {
+  setAiStatus('loading', 'Clearing cached model…');
+  aiClearCacheBtn.disabled = true;
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab) {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => window.__UAI_clearLamaCache?.(),
+      }).catch(() => {});
+    }
+    setAiStatus('idle', 'Cache cleared — model will re-download on next use');
+  } catch {
+    setAiStatus('error', 'Could not clear cache — try refreshing the Gemini page');
+  } finally {
+    aiClearCacheBtn.disabled = false;
+  }
+});
+
 // ── Live storage updates ───────────────────────────────────────────────────
 chrome.storage.onChanged.addListener((changes) => {
   if (changes.stats?.newValue) {
@@ -156,8 +305,8 @@ chrome.storage.onChanged.addListener((changes) => {
 scanBtn.addEventListener('click', scanPageImages);
 
 async function scanPageImages() {
-  scanBtn.disabled      = true;
-  scanBtn.textContent   = '…';
+  scanBtn.disabled        = true;
+  scanBtn.textContent     = '…';
   imageGrid.style.display = 'none';
   if (dlAllBtn) dlAllBtn.style.display = 'none';
   scanHint.textContent = 'Scanning…';
@@ -168,7 +317,6 @@ async function scanPageImages() {
 
     const isGemini = tab.url?.includes('gemini.google.com') ||
                      tab.url?.includes('aistudio.google.com');
-
     if (!isGemini) {
       scanHint.textContent = 'Open Gemini or AI Studio first';
       return;
@@ -180,7 +328,6 @@ async function scanPageImages() {
     });
 
     const images = results?.[0]?.result ?? [];
-
     if (!images.length) {
       scanHint.textContent = 'No images found — generate one in Gemini first';
       return;
@@ -199,6 +346,9 @@ async function scanPageImages() {
     renderImageGrid(images, tab.id);
     imageGrid.style.display = 'grid';
 
+    // Refresh AI status now that we know the tab is active
+    if (cfg.method === 'ai') updateAiStatusBar(true);
+
   } catch (e) {
     scanHint.textContent = `Error: ${e.message}`;
     console.error('[UAI popup]', e);
@@ -212,7 +362,7 @@ async function scanPageImages() {
 if (dlAllBtn) {
   dlAllBtn.addEventListener('click', async () => {
     dlAllBtn.disabled    = true;
-    dlAllBtn.textContent = 'Processing…';
+    dlAllBtn.textContent = cfg.method === 'ai' ? 'AI processing…' : 'Processing…';
 
     const tabId = dlAllBtn._tabId;
     if (!tabId) { dlAllBtn.textContent = 'Error'; return; }
@@ -222,7 +372,6 @@ if (dlAllBtn) {
         target: { tabId },
         func: () => (window.__UAI_downloadAll?.()) ?? { ok: false, error: 'Not loaded' },
       });
-
       const result = results?.[0]?.result;
       if (result?.ok) {
         dlAllBtn.textContent = `✓ Done (${result.succeeded}/${result.total})`;
@@ -230,12 +379,10 @@ if (dlAllBtn) {
         statSession.textContent = (cur + result.succeeded).toLocaleString();
         bump(statSession);
       } else {
-        dlAllBtn.textContent = 'Failed';
-        dlAllBtn.disabled    = false;
+        dlAllBtn.textContent = 'Failed'; dlAllBtn.disabled = false;
       }
     } catch (err) {
-      dlAllBtn.textContent = 'Error';
-      dlAllBtn.disabled    = false;
+      dlAllBtn.textContent = 'Error'; dlAllBtn.disabled = false;
       console.error('[UAI popup]', err);
     }
   });
@@ -246,30 +393,26 @@ function renderImageGrid(images, tabId) {
   imageGrid.innerHTML = '';
 
   images.forEach(img => {
-    const card    = document.createElement('div');
+    const card = document.createElement('div');
     card.className = 'img-card';
-    card.title    = `${img.width} × ${img.height}`;
+    card.title = `${img.width} × ${img.height}`;
 
-    const thumb   = document.createElement('img');
-    thumb.src     = img.src;
-    thumb.loading = 'lazy';
-    thumb.alt     = img.alt || '';
+    const thumb = document.createElement('img');
+    thumb.src = img.src; thumb.loading = 'lazy'; thumb.alt = img.alt || '';
 
     const overlay = document.createElement('div');
     overlay.className = 'img-card-overlay';
 
-    const info    = document.createElement('span');
+    const info = document.createElement('span');
     info.textContent = `${img.width}×${img.height}`;
 
-    const dlBtn   = document.createElement('button');
-    dlBtn.textContent = '↓ Clean';
+    const dlBtn = document.createElement('button');
+    dlBtn.textContent = cfg.method === 'ai' ? '✦ Clean' : '↓ Clean';
 
     dlBtn.addEventListener('click', async e => {
       e.stopPropagation();
       if (dlBtn.disabled) return;
-
-      dlBtn.disabled    = true;
-      dlBtn.textContent = '…';
+      dlBtn.disabled = true; dlBtn.textContent = '…';
 
       const ring = document.createElement('div');
       ring.className = 'processing-ring';
@@ -292,21 +435,19 @@ function renderImageGrid(images, tabId) {
 
         if (result?.ok) {
           const badge = document.createElement('div');
-          badge.className = 'img-done';
-          badge.textContent = '✓';
+          badge.className = 'img-done'; badge.textContent = '✓';
           card.appendChild(badge);
           dlBtn.textContent = '✓';
           const cur = parseInt(statSession.textContent.replace(/,/g, ''), 10) || 0;
           statSession.textContent = (cur + 1).toLocaleString();
           bump(statSession);
+          // Refresh AI status after first successful inference
+          if (cfg.method === 'ai') updateAiStatusBar(true);
         } else {
-          dlBtn.textContent = '✗';
-          dlBtn.disabled    = false;
+          dlBtn.textContent = '✗'; dlBtn.disabled = false;
         }
       } catch {
-        ring.remove();
-        dlBtn.textContent = '✗';
-        dlBtn.disabled    = false;
+        ring.remove(); dlBtn.textContent = '✗'; dlBtn.disabled = false;
       }
     });
 

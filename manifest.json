@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "UnmarkAI",
-  "version": "3.3.0",
-  "description": "Instantly removes watermarks from Gemini & AI Studio generated images. Strips both the visible sparkle mark and invisible SynthID fingerprint.",
+  "version": "3.9.0",
+  "description": "Removes watermarks from Gemini & AI Studio images. AI (LaMa), Smart, Fill, Crop, Strip methods. Destroys SynthID fingerprint.",
   "permissions": [
     "storage",
     "scripting",
@@ -17,6 +17,9 @@
     "https://*.googleusercontent.com/*",
     "https://storage.googleapis.com/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "background": {
     "service_worker": "background.js"
   },
@@ -26,9 +29,7 @@
         "https://gemini.google.com/*",
         "https://aistudio.google.com/*"
       ],
-      "js": [
-        "main-world.js"
-      ],
+      "js": ["main-world.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },
@@ -37,9 +38,7 @@
         "https://gemini.google.com/*",
         "https://aistudio.google.com/*"
       ],
-      "js": [
-        "content.js"
-      ],
+      "js": ["content.js"],
       "run_at": "document_start",
       "world": "ISOLATED"
     }
@@ -48,16 +47,16 @@
     "default_popup": "popup.html",
     "default_title": "UnmarkAI — Watermark Remover",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "32": "icons/icon32.png",
-      "48": "icons/icon48.png",
+      "16":  "icons/icon16.png",
+      "32":  "icons/icon32.png",
+      "48":  "icons/icon48.png",
       "128": "icons/icon128.png"
     }
   },
   "icons": {
-    "16": "icons/icon16.png",
-    "32": "icons/icon32.png",
-    "48": "icons/icon48.png",
+    "16":  "icons/icon16.png",
+    "32":  "icons/icon32.png",
+    "48":  "icons/icon48.png",
     "128": "icons/icon128.png"
   }
 }

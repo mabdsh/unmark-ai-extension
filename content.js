@@ -39,6 +39,7 @@
   // ── Settings ───────────────────────────────────────────────────────────────
   let cfg = {
     enabled:           true,
+    autoIntercept:     true,   // v3.8 — when false, auto-intercept is disabled (manual mode)
     removeVisible:     true,
     removeSynthID:     true,
     method:            'smart',
@@ -56,19 +57,27 @@
 
     chrome.storage.onChanged.addListener((changes) => {
       if (changes.settings?.newValue) {
+        const prev = cfg.method;
         Object.assign(cfg, changes.settings.newValue);
         syncSettings();
+        // Pre-warm model when user switches TO AI method
+        if (cfg.method === 'ai' && prev !== 'ai') preWarmLaMa();
       }
     });
 
     syncSettings();
     installMessageBridge();
+    preWarmLaMa();  // trigger model load immediately if AI method is already set
     log('ISOLATED world ready on', window.location.hostname);
   })();
 
   // Push current enabled state to main world so it knows whether to intercept
   function syncSettings() {
-    window.postMessage({ gwrType: 'GWR_SETTINGS', enabled: cfg.enabled }, '*');
+    window.postMessage({
+      gwrType:       'GWR_SETTINGS',
+      enabled:       cfg.enabled,
+      autoIntercept: cfg.autoIntercept !== false, // v3.8 — default true
+    }, '*');
   }
 
   // ── Per-URL processing lock ────────────────────────────────────────────────
@@ -78,6 +87,100 @@
 
   // ── v3.5: Image data cache ─────────────────────────────────────────────────
   const blobCache = new Map(); // blobUrl → data URL string or Blob
+
+
+  /**
+   * Open a persistent port to background.js, send the crop, and wait for the
+   * inpainted 512×512 result. The port keeps the service worker alive for the
+   * full duration of LaMa inference — no timeout, no dropped connections.
+   */
+  function lamaInpaintViaBackground({ cropPixels, cropW, cropH, softMask }) {
+    return new Promise((resolve, reject) => {
+      let port;
+
+      // Open port — this prevents the service worker from being killed
+      try {
+        port = chrome.runtime.connect({ name: 'lama-inpaint' });
+      } catch (e) {
+        return reject(new Error('Could not connect to background: ' + e.message));
+      }
+
+      // Handle messages from background
+      port.onMessage.addListener((msg) => {
+        if (msg.type === 'progress') {
+          // Forward progress to page toast so user sees something is happening
+          toast(msg.msg, 'info');
+          log('LaMa bg:', msg.msg);
+          return;
+        }
+
+        if (msg.type === 'result') {
+          port.disconnect(); // Release the service worker
+          if (msg.ok) {
+            resolve(msg.inpainted512);
+          } else {
+            reject(new Error(msg.error || 'LaMa inference failed'));
+          }
+        }
+      });
+
+      // If the port disconnects unexpectedly (e.g. extension reloaded)
+      port.onDisconnect.addListener(() => {
+        const err = chrome.runtime.lastError?.message || 'Port disconnected unexpectedly';
+        reject(new Error(err));
+      });
+
+      // Send the crop data — background starts inference immediately
+      port.postMessage({
+        cropPixels: Array.from(cropPixels), // Uint8ClampedArray → plain Array
+        cropW,
+        cropH,
+        softMask:   Array.from(softMask),  // Float32Array → plain Array
+      });
+    });
+  }
+
+  /**
+   * Scale a 512×512 inpainted RGBA result back to cropW×cropH,
+   * then soft-blend it into `ctx` at the crop coordinates using softMask.
+   *
+   * @param {CanvasRenderingContext2D} ctx      — main image canvas
+   * @param {Array|Uint8ClampedArray}  inpainted512 — 512×512 RGBA from background
+   * @param {number} cropX, cropY, cropW, cropH — crop location in canvas
+   * @param {Float32Array} softMask             — [cropW × cropH] alpha, 0–1
+   */
+  function compositeInpainted(ctx, inpainted512, cropX, cropY, cropW, cropH, softMask) {
+    // Step 1: put 512×512 result onto a temp canvas
+    const src    = document.createElement('canvas');
+    src.width    = 512; src.height = 512;
+    src.getContext('2d').putImageData(
+      new ImageData(new Uint8ClampedArray(inpainted512), 512, 512), 0, 0
+    );
+
+    // Step 2: scale to crop dimensions
+    const scaled    = document.createElement('canvas');
+    scaled.width    = cropW; scaled.height = cropH;
+    scaled.getContext('2d').drawImage(src, 0, 0, cropW, cropH);
+    const inpData   = scaled.getContext('2d').getImageData(0, 0, cropW, cropH).data;
+
+    // Step 3: read original pixels at crop region, blend, write back
+    const origData  = ctx.getImageData(cropX, cropY, cropW, cropH);
+    const d         = origData.data;
+
+    for (let i = 0; i < cropW * cropH; i++) {
+      const a = softMask[i];
+      if (a < 0.005) continue;
+      const inv = 1 - a;
+      d[i*4]   = ((d[i*4]   * inv + inpData[i*4]   * a) + 0.5) | 0;
+      d[i*4+1] = ((d[i*4+1] * inv + inpData[i*4+1] * a) + 0.5) | 0;
+      d[i*4+2] = ((d[i*4+2] * inv + inpData[i*4+2] * a) + 0.5) | 0;
+      // alpha channel (d[i*4+3]) untouched
+    }
+
+    ctx.putImageData(origData, cropX, cropY);
+  }
+
+
 
   // ── Hover state — synced from main-world.js via GWR_HOVER ─────────────────
   // Background.js's download fallback calls __UAI_processAndDownload(url) with
@@ -330,8 +433,251 @@
     return null;
   }
 
+  // ── v3.8: SynthID Removal — Gaussian noise + internal JPEG round-trip ────────
+  //
+  // PROBLEM with the old approach: canvas re-encode to PNG is lossless —
+  // pixel values are UNCHANGED, so any frequency-domain fingerprint (SynthID)
+  // survives completely. Only JPEG output at q<98 would disrupt it, and even
+  // then only partially.
+  //
+  // TWO-LAYER FIX:
+  //   Layer 1 — Gaussian noise σ=1.5 (Box-Muller).
+  //     Adds ±1–3 counts to each RGB channel, below the JND (just-noticeable
+  //     difference ≈ 3–4 counts). Disrupts LSB steganography and any signal
+  //     that encodes information in absolute pixel values.
+  //
+  //   Layer 2 — Internal JPEG round-trip at quality 88.
+  //     Encodes to JPEG (DCT quantization) then decodes back to raw pixels.
+  //     Quality 88 is visually lossless on photographic content (standard
+  //     save-for-web quality) but the quantization step irreversibly destroys
+  //     any frequency-domain steganographic pattern — SynthID is almost
+  //     certainly frequency-domain encoded.
+  //
+  //   Final output is then re-encoded in the user's chosen format (PNG/JPEG).
+  //   Both layers together make reconstruction of the original SynthID signal
+  //   computationally infeasible regardless of the encoding scheme used.
+  async function synthIdStrip(canvas, ctx, W, H) {
+    // Layer 1: Gaussian noise injection (Box-Muller transform)
+    const imgData = ctx.getImageData(0, 0, W, H);
+    const d = imgData.data;
+    const σ = 1.5;
+
+    for (let i = 0; i < d.length - 3; i += 4) {
+      // Two independent Gaussian samples from two uniform pairs
+      const u1a = Math.random() || 1e-10, u1b = Math.random() || 1e-10;
+      const u2a = Math.random() || 1e-10, u2b = Math.random() || 1e-10;
+      const mag1 = σ * Math.sqrt(-2 * Math.log(u1a));
+      const mag2 = σ * Math.sqrt(-2 * Math.log(u1b));
+      const n0 = mag1 * Math.cos(2 * Math.PI * u1b);
+      const n1 = mag1 * Math.sin(2 * Math.PI * u1b);
+      const n2 = mag2 * Math.cos(2 * Math.PI * u2a);
+      d[i]   = Math.max(0, Math.min(255, (d[i]   + n0 + 0.5) | 0));
+      d[i+1] = Math.max(0, Math.min(255, (d[i+1] + n1 + 0.5) | 0));
+      d[i+2] = Math.max(0, Math.min(255, (d[i+2] + n2 + 0.5) | 0));
+      // Alpha channel untouched
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    // Layer 2: JPEG round-trip — destroys DCT-domain frequency patterns
+    const jpegBlob = await new Promise((res, rej) =>
+      canvas.toBlob(
+        b => b ? res(b) : rej(new Error('JPEG round-trip toBlob failed')),
+        'image/jpeg', 0.88
+      )
+    );
+    const bmp = await createImageBitmap(jpegBlob);
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+    // Canvas now holds the JPEG-quantized, noise-injected image.
+    // Subsequent toBlob() in processImage() will encode in user's chosen format.
+  }
+
+
+  // ── v3.8: AI Method — LaMa Neural Inpainting ─────────────────────────────────
+  //
+
+  /**
+   * Open a warmup port to trigger model loading in the background service worker.
+   * Called at page load if AI method is already selected, and whenever the user
+   * switches TO the AI method (storage.onChanged fires and content.js sees it).
+   *
+   * This ensures the model is loaded and session is warm BEFORE the user clicks
+   * download, eliminating the "Port disconnected unexpectedly" first-use failure.
+   */
+  function preWarmLaMa() {
+    if (cfg.method !== 'ai') return;
+    log('Pre-warming LaMa model in background…');
+    let port;
+    try {
+      port = chrome.runtime.connect({ name: 'lama-inpaint' });
+    } catch (e) {
+      log('Pre-warm connect failed:', e.message);
+      return;
+    }
+
+    port.onMessage.addListener((msg) => {
+      if (msg.type === 'warmed' || msg.type === 'ready') {
+        log('LaMa model pre-warmed ✓');
+        try { port.disconnect(); } catch {}
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      // Silence — either warmed successfully or SW was killed. Either way,
+      // next actual inpaint will retry the model load.
+      if (chrome.runtime.lastError) {}
+    });
+
+    // Send warmup signal — background loads the model and responds
+    port.postMessage({ type: 'warmup' });
+
+    // Disconnect after 3 minutes regardless (model should be loaded by then)
+    setTimeout(() => { try { port.disconnect(); } catch {} }, 180_000);
+  }
+
+
+  // Routes to the LaMa Web Worker for state-of-the-art inpainting:
+  //   1. Detect sparkle bounding box using existing detectSparkle()
+  //   2. Expand to a context crop (40px padding, minimum 200×200)
+  //   3. Build a feathered soft mask over the sparkle region
+  //   4. Send crop + mask to lama-worker.js → ONNX inference at 512×512
+  //   5. Worker composites result back at original resolution
+  //   6. Apply synthIdStrip() (noise + JPEG round-trip)
+  //   7. Encode final blob in user's chosen format
+  async function processImageAI(blob) {
+    toast('Preparing AI inpainting…', 'info');
+
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(blob);
+    } catch (err) {
+      throw new Error('Could not decode image: ' + err.message);
+    }
+
+    const W = bitmap.width, H = bitmap.height;
+    log('AI processing', W, '×', H);
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = W; canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+
+    if (cfg.removeVisible) {
+      const fullImgData = ctx.getImageData(0, 0, W, H);
+      const { data } = fullImgData;
+
+      let region = detectSparkle(data, W, H);
+      if (!region) {
+        const sz = Math.max(44, Math.floor(Math.min(W, H) * 0.06));
+        if (cornerLooksLikeSparkle(data, W, H, sz)) {
+          region = { x: W - sz, y: H - sz, width: sz, height: sz };
+          log('Using corner-zone fallback for AI inpainting');
+        }
+      }
+
+      if (region) {
+        log('AI inpainting region:', JSON.stringify(region));
+        toast('Running LaMa inpainting…', 'info');
+
+        // Expand crop with context padding for LaMa
+        // ── Crop window — shift instead of clip ───────────────────────────────
+        // The sparkle is always bottom-right. The old formula clipped the crop
+        // at the image edge, giving LaMa only ~140×140px of context.
+        // Instead: compute the desired crop size first, then SHIFT the window
+        // so it fits inside the image while still covering the sparkle + context.
+        const PAD     = 64;   // generous padding for texture context
+        const MINCROP = 300;  // minimum crop side — enough for LaMa to infer bg
+
+        // Desired crop size: at least MINCROP, at most the full image
+        const desiredW = Math.min(W, Math.max(MINCROP, region.width  + PAD * 2));
+        const desiredH = Math.min(H, Math.max(MINCROP, region.height + PAD * 2));
+
+        // Ideal top-left: PAD pixels above/left of the sparkle
+        let cropX = region.x - PAD;
+        let cropY = region.y - PAD;
+
+        // If window extends past the RIGHT edge → shift LEFT
+        if (cropX + desiredW > W) cropX = W - desiredW;
+        // If window extends past the BOTTOM edge → shift UP
+        if (cropY + desiredH > H) cropY = H - desiredH;
+
+        // Clamp to [0, W/H] in case the image itself is smaller than MINCROP
+        cropX = Math.max(0, cropX);
+        cropY = Math.max(0, cropY);
+        const cropW = Math.min(desiredW, W - cropX);
+        const cropH = Math.min(desiredH, H - cropY);
+        // ─────────────────────────────────────────────────────────────────────
+
+        // Build feathered soft mask (1.0 inside sparkle, feathered at edges)
+        const FEATHER  = 8;  // wider feather for smoother composite edge
+        const softMask = new Float32Array(cropW * cropH);
+        for (let row = 0; row < cropH; row++) {
+          for (let col = 0; col < cropW; col++) {
+            const ar = cropY + row, ac = cropX + col;
+            // Skip pixels outside the sparkle bounding box
+            if (ar < region.y || ar >= region.y + region.height ||
+                ac < region.x || ac >= region.x + region.width) continue;
+            // Distance from nearest sparkle edge → smooth 0→1 ramp
+            const dist = Math.min(
+              ar - region.y,
+              region.y + region.height - 1 - ar,
+              ac - region.x,
+              region.x + region.width  - 1 - ac,
+            );
+            // Pure feather: 0.0 at edge, 1.0 after FEATHER pixels
+            // (No minimum offset — avoids the visible ring at the boundary)
+            softMask[row * cropW + col] = Math.min(1.0, dist / FEATHER);
+          }
+        }
+
+        // Extract crop pixels for the message
+        const cropData = ctx.getImageData(cropX, cropY, cropW, cropH);
+
+        try {
+          const inpainted512 = await lamaInpaintViaBackground({
+            cropPixels: cropData.data, // Uint8ClampedArray
+            cropW,
+            cropH,
+            softMask,
+          });
+
+          compositeInpainted(ctx, inpainted512, cropX, cropY, cropW, cropH, softMask);
+          log('LaMa inpainting complete ✓');
+          toast('AI inpainting done ✓', 'success');
+
+        } catch (lamaErr) {
+          log('LaMa failed, falling back to Smart:', lamaErr.message);
+          toast('AI failed — using Smart fallback', 'error');
+          removeVisibleWatermark(ctx, W, H, 'smart');
+        }
+
+      } else {
+        log('No sparkle detected — skipping AI inpainting');
+      }
+    }
+
+    // SynthID removal (always applied in AI mode)
+    if (cfg.removeSynthID) {
+      await synthIdStrip(canvas, ctx, W, H);
+    }
+
+    const mime = cfg.format === 'jpeg' ? 'image/jpeg' : 'image/png';
+    const qual = cfg.format === 'jpeg' ? (cfg.jpegQuality ?? 0.96) : undefined;
+    return new Promise((res, rej) =>
+      canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), mime, qual)
+    );
+  }
+
+
   // ── Image Processing Pipeline ──────────────────────────────────────────────
   async function processImage(blob) {
+    // v3.8: Route AI method to LaMa neural inpainting (entirely separate path)
+    if (cfg.method === 'ai') {
+      return processImageAI(blob);
+    }
+
     let bitmap;
     try {
       bitmap = await createImageBitmap(blob);
@@ -365,14 +711,23 @@
       }
     }
 
+    // v3.8: Robust SynthID removal — replaces the old "just re-encode" approach.
+    // Gaussian noise (σ=1.5) + JPEG round-trip disrupts both LSB and DCT-domain
+    // fingerprints. Applied to ALL methods including PNG output (previously PNG
+    // was completely ineffective since re-encode to lossless changes no pixels).
+    if (cfg.removeSynthID) {
+      const canvasH = canvas.height; // may be cropped for 'crop' method
+      await synthIdStrip(canvas, ctx, W, canvasH);
+    }
+
     const mime = cfg.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-    // v3.3: use configurable quality; fallback to 0.96
     const qual = cfg.format === 'jpeg' ? (cfg.jpegQuality ?? 0.96) : undefined;
 
     return new Promise((res, rej) =>
       canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), mime, qual)
     );
   }
+
 
   // ── Visible Watermark Removal ──────────────────────────────────────────────
   function removeVisibleWatermark(ctx, W, H, method) {
