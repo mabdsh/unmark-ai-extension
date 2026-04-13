@@ -117,6 +117,7 @@
           pendingImageSrc = img.src;
           document.documentElement.dataset.uaiClickedSrc  = img.src;
           document.documentElement.dataset.uaiClickedTime = Date.now().toString();
+          document.documentElement.dataset.uaiClickedRcId  = m[1]; // OPT 8: filename preservation
           log('jslog rc_ hit:', m[1], '→', img.src.slice(0, 60));
           return;
         }

@@ -4,7 +4,7 @@
   <meta charset="UTF-8"/>
   <title>UnmarkAI</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="popup.css"/>
 </head>
 <body>
@@ -35,149 +35,88 @@
   <div class="stats">
     <div class="stat">
       <span class="stat-n" id="statTotal">0</span>
-      <span class="stat-l">cleaned total</span>
+      <span class="stat-l">total cleaned</span>
     </div>
     <span class="stat-div"></span>
     <div class="stat">
       <span class="stat-n" id="statSession">0</span>
       <span class="stat-l">this session</span>
     </div>
-    <span class="stat-div"></span>
-    <div class="stat">
-      <span class="stat-n mode-stat-n" id="statMode">AUTO</span>
-      <span class="stat-l">mode</span>
-    </div>
   </div>
 
-  <!-- ── Intercept Mode ── -->
-  <section class="mode-card" id="modeCard">
-    <div class="mode-header">
-      <div class="mode-icon-wrap" id="modeIconWrap">
-        <!-- Auto icon -->
-        <svg id="modeIconAuto" width="14" height="14" viewBox="0 0 14 14" fill="none">
-          <path d="M7 1L8.1 5.9L13 7L8.1 8.1L7 13L5.9 8.1L1 7L5.9 5.9Z" fill="currentColor"/>
-        </svg>
-        <!-- Manual icon -->
-        <svg id="modeIconManual" width="14" height="14" viewBox="0 0 14 14" fill="none" style="display:none">
-          <rect x="2" y="2" width="4" height="4" rx="1" fill="currentColor"/>
-          <rect x="8" y="2" width="4" height="4" rx="1" fill="currentColor"/>
-          <rect x="2" y="8" width="4" height="4" rx="1" fill="currentColor"/>
-          <rect x="8" y="8" width="4" height="4" rx="1" fill="currentColor" opacity="0.4"/>
-        </svg>
-      </div>
-      <div class="mode-text-group">
-        <span class="mode-title" id="modeTitle">Auto Intercept</span>
-        <span class="mode-desc" id="modeDesc">Downloads are cleaned automatically when you click ↓ in Gemini</span>
-      </div>
-      <div class="mode-segs-wrap">
-        <div class="seg-ctrl mode-segs" id="modeSegCtrl">
-          <button class="seg mode-seg active" data-mode="auto">Auto</button>
-          <button class="seg mode-seg" data-mode="manual">Manual</button>
+  <!-- ── Method ── -->
+  <section class="method-section" id="methodSection">
+    <div class="section-label">Cleaning method</div>
+    <div class="method-pills">
+      <button class="method-pill" data-method="smart" id="pillSmart">
+        <div class="pill-icon-wrap">
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+            <path d="M6.5 1L7.5 5.5L12 6.5L7.5 7.5L6.5 12L5.5 7.5L1 6.5L5.5 5.5Z" fill="currentColor"/>
+          </svg>
         </div>
+        <div class="pill-text">
+          <span class="pill-name">Smart</span>
+          <span class="pill-desc">Fast · No download</span>
+        </div>
+      </button>
+      <button class="method-pill" data-method="ai" id="pillAi">
+        <div class="pill-icon-wrap">
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+            <path d="M6.5 0.5L7.9 4.6L12 6.5L7.9 8.4L6.5 12.5L5.1 8.4L1 6.5L5.1 4.6Z" fill="currentColor"/>
+          </svg>
+        </div>
+        <div class="pill-text">
+          <span class="pill-name">Advance</span>
+          <span class="pill-desc">AI · Best quality</span>
+        </div>
+        <span class="pill-badge" id="pillAiBadge" style="display:none"></span>
+      </button>
+    </div>
+
+    <!-- AI model status — shown when Advance is active -->
+    <div class="model-status" id="modelStatus" style="display:none">
+      <div id="modelStatusInner"></div>
+    </div>
+  </section>
+
+  <!-- ── Settings ── -->
+  <section class="settings-section" id="settingsSection">
+    <div class="toggle-row">
+      <div class="toggle-info">
+        <span class="toggle-label">Auto-clean on download</span>
+        <span class="toggle-sub" id="autoCleanSub">Removes watermarks automatically when you click ↓ in Gemini</span>
       </div>
+      <label class="sw">
+        <input type="checkbox" id="autoCleanCheckbox"/>
+        <span class="sw-rail"><span class="sw-thumb"></span></span>
+      </label>
     </div>
   </section>
 
   <!-- ── Scan ── -->
   <section class="scan" id="scanSection">
     <div class="scan-row">
-      <span class="scan-hint" id="scanHint">Open a Gemini page to scan for images</span>
+      <div class="scan-hint-wrap">
+        <span class="scan-hint" id="scanHint">Open a Gemini page to scan for images</span>
+      </div>
       <div class="scan-actions">
         <button class="btn-ghost" id="dlAllBtn" style="display:none">Clean all</button>
         <button class="btn-primary" id="scanBtn">Scan page</button>
       </div>
     </div>
+    <!-- Model downloading notice — shown in scan area when model is busy -->
+    <div class="dl-notice" id="dlNotice" style="display:none">
+      <div class="dl-notice-bar" id="dlNoticeBar"></div>
+      <span class="dl-notice-text" id="dlNoticeText"></span>
+    </div>
     <div class="img-grid" id="imageGrid" style="display:none"></div>
   </section>
-
-  <!-- ── Settings ── -->
-  <div class="settings">
-
-    <div class="settings-group">
-      <!-- Method row — includes AI button -->
-      <div class="cfg-row">
-        <span class="cfg-label">Method</span>
-        <div class="method-ctrl">
-          <div class="seg-ctrl" id="methodGrid">
-            <button class="seg" data-method="smart" title="PatchMatch + IDW: best classical method">Smart</button>
-            <button class="seg" data-method="fill"  title="Copy pixels from above — fast, plain backgrounds">Fill</button>
-            <button class="seg" data-method="crop"  title="Trim bottom 8% — removes badge entirely">Crop</button>
-            <button class="seg" data-method="strip" title="Re-encode only — no visible removal, SynthID disrupted">Strip</button>
-          </div>
-          <!-- AI button sits outside the seg-ctrl — distinct accent -->
-          <button class="btn-ai" id="aiMethodBtn" data-method="ai" title="LaMa neural inpainting — best quality, requires one-time model download (~20 MB)">
-            <svg class="ai-icon" width="11" height="11" viewBox="0 0 11 11" fill="none">
-              <path d="M5.5 0.5L6.4 4.1L10 5.5L6.4 6.9L5.5 10.5L4.6 6.9L1 5.5L4.6 4.1Z" fill="currentColor"/>
-            </svg>
-            AI
-          </button>
-        </div>
-      </div>
-
-      <!-- AI model status bar — visible only when AI method is selected -->
-      <div class="ai-status-bar" id="aiStatusBar" style="display:none">
-        <div class="ai-status-inner" id="aiStatusInner">
-          <span class="ai-status-dot" id="aiStatusDot"></span>
-          <span class="ai-status-text" id="aiStatusText">LaMa model not loaded — will download on first use (~20 MB)</span>
-        </div>
-        <button class="ai-cache-btn" id="aiClearCacheBtn" title="Clear cached model and re-download">↺</button>
-      </div>
-
-      <div class="cfg-row">
-        <span class="cfg-label">Format</span>
-        <div class="seg-ctrl">
-          <button class="seg format-seg" data-format="png">PNG</button>
-          <button class="seg format-seg" data-format="jpeg">JPEG</button>
-        </div>
-      </div>
-
-      <div class="quality-row" id="qualityRow" style="display:none">
-        <span class="cfg-label">Quality</span>
-        <div class="quality-ctrl">
-          <input type="range" class="q-range" id="qualitySlider"
-                 min="50" max="99" step="1" value="96" aria-label="JPEG quality">
-          <span class="quality-val" id="qualityValue">96%</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="rule"></div>
-
-    <div class="toggles-group">
-      <div class="toggle-row">
-        <div class="toggle-label-wrap">
-          <span class="toggle-label">Remove sparkle watermark</span>
-        </div>
-        <label class="sw"><input type="checkbox" id="removeVisibleCheckbox">
-          <span class="sw-rail"><span class="sw-thumb"></span></span></label>
-      </div>
-      <div class="toggle-row">
-        <div class="toggle-label-wrap">
-          <span class="toggle-label">Strip SynthID fingerprint</span>
-          <span class="toggle-hint" id="synthIdHint">Noise + JPEG round-trip</span>
-        </div>
-        <label class="sw"><input type="checkbox" id="removeSynthIDCheckbox">
-          <span class="sw-rail"><span class="sw-thumb"></span></span></label>
-      </div>
-      <div class="toggle-row last">
-        <div class="toggle-label-wrap">
-          <span class="toggle-label">Page notifications</span>
-        </div>
-        <label class="sw"><input type="checkbox" id="notifCheckbox">
-          <span class="sw-rail"><span class="sw-thumb"></span></span></label>
-      </div>
-    </div>
-
-  </div>
 
   <!-- ── Footer ── -->
   <footer class="footer">
     <button class="lnk-btn" id="resetBtn">Reset stats</button>
-    <span class="ver">v3.8.0</span>
+    <span class="ver">v4.0.0</span>
   </footer>
-
-  <input type="radio" name="format" value="png"  id="formatPng"  style="display:none">
-  <input type="radio" name="format" value="jpeg" id="formatJpeg" style="display:none">
 
   <script src="popup.js"></script>
 </body>

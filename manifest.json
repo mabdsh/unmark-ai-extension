@@ -1,21 +1,25 @@
 {
   "manifest_version": 3,
   "name": "UnmarkAI",
-  "version": "3.9.0",
-  "description": "Removes watermarks from Gemini & AI Studio images. AI (LaMa), Smart, Fill, Crop, Strip methods. Destroys SynthID fingerprint.",
+  "version": "4.0.0",
+  "description": "Removes watermarks from Gemini & AI Studio images. AI (LaMa) + Smart methods. WebGL-accelerated inference. Destroys SynthID fingerprint.",
   "permissions": [
     "storage",
     "scripting",
     "contextMenus",
     "downloads",
-    "tabs"
+    "tabs",
+    "alarms"
   ],
   "host_permissions": [
     "https://gemini.google.com/*",
     "https://aistudio.google.com/*",
     "https://*.googleapis.com/*",
     "https://*.googleusercontent.com/*",
-    "https://storage.googleapis.com/*"
+    "https://storage.googleapis.com/*",
+    "https://github.com/*",
+    "https://objects.githubusercontent.com/*",
+    "https://release-assets.githubusercontent.com/*"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
@@ -29,7 +33,9 @@
         "https://gemini.google.com/*",
         "https://aistudio.google.com/*"
       ],
-      "js": ["main-world.js"],
+      "js": [
+        "main-world.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
@@ -38,25 +44,27 @@
         "https://gemini.google.com/*",
         "https://aistudio.google.com/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start",
       "world": "ISOLATED"
     }
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "UnmarkAI — Watermark Remover",
+    "default_title": "UnmarkAI \u2014 Watermark Remover",
     "default_icon": {
-      "16":  "icons/icon16.png",
-      "32":  "icons/icon32.png",
-      "48":  "icons/icon48.png",
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
   },
   "icons": {
-    "16":  "icons/icon16.png",
-    "32":  "icons/icon32.png",
-    "48":  "icons/icon48.png",
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   }
 }
