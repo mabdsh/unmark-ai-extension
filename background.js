@@ -1,17 +1,14 @@
 /**
- * UnmarkAI v4.0.6 — Background Service Worker
+ * UnmarkAI — Background Service Worker
  *
- * v4.0.4 ARCHITECTURE CHANGE:
- *   ORT inference moved to an Offscreen Document (offscreen.html / offscreen.js).
- *   Service workers in MV3 lack URL.createObjectURL, document, and DOM APIs that
- *   ORT needs internally. The offscreen document has full DOM access and stays
- *   alive as long as it's processing requests.
- *
- *   This file is now a thin router:
- *     - Spawns the offscreen document on demand
- *     - Forwards lama-inpaint port messages to offscreen via sendMessage
- *     - Mirrors offscreen's modelLoadState so popup ports stay informed
- *     - Continues to handle: downloads, settings, badges, context menu
+ * ORT inference runs in an Offscreen Document (offscreen.html / offscreen.js)
+ * because MV3 service workers lack URL.createObjectURL, document, and the DOM
+ * APIs ORT needs. This file is a thin router:
+ *   - Spawns the offscreen document on demand.
+ *   - Forwards lama-inpaint port messages to offscreen via sendMessage.
+ *   - Mirrors offscreen's modelLoadState so popup ports stay informed.
+ *   - Handles: download interception, settings, badge, icon, context menu,
+ *     and daily stats.
  */
 'use strict';
 
@@ -20,27 +17,41 @@ const OFFSCREEN_URL = 'offscreen.html';
 let creatingOffscreen = null;
 
 async function ensureOffscreen() {
-  // Already exists?
-  const existing = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-  }).catch(() => []);
-  if (existing.length > 0) return;
-
-  // Dedup concurrent creations
+  // Dedup concurrent creations: claim the slot synchronously BEFORE any await.
+  // Previous version awaited getContexts() first, which let two callers both
+  // observe `existing.length === 0` and both reach createDocument.
   if (creatingOffscreen) return creatingOffscreen;
 
-  creatingOffscreen = chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: ['BLOBS', 'WORKERS'],
-    justification: 'Run LaMa ONNX model inference for image inpainting (DOM APIs required)',
-  }).finally(() => { creatingOffscreen = null; });
+  creatingOffscreen = (async () => {
+    try {
+      const existing = await chrome.runtime.getContexts({
+        contextTypes: ['OFFSCREEN_DOCUMENT'],
+      }).catch(() => []);
+      if (existing.length > 0) return;
+
+      try {
+        await chrome.offscreen.createDocument({
+          url: OFFSCREEN_URL,
+          reasons: ['BLOBS', 'WORKERS'],
+          justification: 'Run LaMa ONNX model inference for image inpainting (DOM APIs required)',
+        });
+      } catch (err) {
+        // If another caller raced past our guard (e.g. across SW restarts)
+        // and created it first, Chrome throws "Only a single offscreen
+        // document may be created." Treat that as success.
+        if (!/single offscreen document/i.test(err?.message || '')) throw err;
+      }
+    } finally {
+      creatingOffscreen = null;
+    }
+  })();
 
   return creatingOffscreen;
 }
 
-// v4.0.6: Pull fresh state from offscreen if it exists. The background mirror
-// can drift if offscreen was killed/respawned by Chrome (the boot push tells
-// the mirror but ordering is not guaranteed; this is a safety net).
+// Pull fresh state from offscreen if it exists. The background mirror can drift
+// if offscreen was killed/respawned by Chrome (the boot push tells the mirror
+// but ordering is not guaranteed; this is a safety net).
 async function refreshModelStateFromOffscreen() {
   try {
     const contexts = await chrome.runtime.getContexts({
@@ -62,7 +73,7 @@ async function offscreenSend(action, payload = {}) {
   return chrome.runtime.sendMessage({ target: 'offscreen', action, ...payload });
 }
 
-// v4.0.6 helpers
+// Is the offscreen document currently alive?
 async function isOffscreenAlive() {
   try {
     const ctxs = await chrome.runtime.getContexts({
@@ -106,10 +117,37 @@ const GEMINI_HOSTS = ['gemini.google.com', 'aistudio.google.com'];
 const ACCENT       = '#2DD4BF';
 const GRAY         = '#6B7280';
 
-let sessionCount          = 0;
-let pendingCleanDownloads = 0;
+// URLs of downloads we ourselves initiated (via chrome.downloads.download in the
+// `downloadClean` handler). The downloads.onCreated listener skips these so we
+// don't re-intercept our own cleaned output.
+//
+// Previously this was a single integer counter (pendingCleanDownloads), which
+// was racy: any unrelated download firing in the interim consumed the counter,
+// letting our own download slip through to re-interception OR masking a user's
+// legitimate save.
+const ourDownloadUrls = new Set();
 let geminiTabActive       = false;
 let cachedSettings        = { enabled: true, autoIntercept: true, method: 'smart' };
+
+// ── Daily stats ──────────────────────────────────────────────────────────────
+// "Today" in the popup is backed by chrome.storage.local (not SW memory, which
+// dies every ~30s of idle in MV3). Key is the local-date YYYY-MM-DD string; a
+// mismatch means a new day and the count resets to 1.
+function todayKey() {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+async function incrementDailyStat() {
+  const key = todayKey();
+  const { dailyStats } = await chrome.storage.local.get('dailyStats');
+  const next = (dailyStats && dailyStats.date === key)
+    ? { date: key, count: dailyStats.count + 1 }
+    : { date: key, count: 1 };
+  await chrome.storage.local.set({ dailyStats: next });
+}
 
 chrome.storage.sync.get('settings', ({ settings }) => {
   if (settings) Object.assign(cachedSettings, settings);
@@ -148,21 +186,15 @@ function unlockUrl(url) { processedUrls.delete(url); }
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   if (reason !== 'install') return;
   await chrome.storage.sync.set({
-    settings: {
-      enabled: true, autoIntercept: true, removeVisible: true,
-      removeSynthID: true, method: 'smart', format: 'png',
-      jpegQuality: 0.96, showNotifications: true,
-    },
-    stats: { totalRemoved: 0, lastReset: Date.now() },
+    settings: { enabled: true, autoIntercept: true, method: 'smart' },
+    stats:    { totalRemoved: 0, lastReset: Date.now() },
   });
-  // v4.0.9: seed cachedSettings + show method-aware badge from first install
   Object.assign(cachedSettings, { enabled: true, autoIntercept: true, method: 'smart' });
   refreshBadge();
   setupContextMenu();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  sessionCount = 0;
   setupContextMenu();
   chrome.storage.sync.get('settings', ({ settings }) => {
     if (settings) Object.assign(cachedSettings, settings);
@@ -193,13 +225,16 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 chrome.downloads.onCreated.addListener(async (item) => {
   try {
     if (!item?.url) return;
-    if (pendingCleanDownloads > 0) { pendingCleanDownloads--; return; }
-    if (item.url.startsWith('data:') || item.url.startsWith('blob:')) {
-      // blob: URLs from our own content-script downloadClean path — but only
-      // skip if it's from us (counter handled above). Other blob: still need
-      // checking, so don't skip blanket. (Original code skipped only data:.)
-      if (item.url.startsWith('data:')) return;
+
+    // Skip downloads we ourselves initiated (our cleaned output going to disk).
+    if (ourDownloadUrls.has(item.url)) {
+      ourDownloadUrls.delete(item.url);
+      return;
     }
+
+    // data: URLs are never Gemini originals we need to intercept.
+    if (item.url.startsWith('data:')) return;
+
     if (!cachedSettings.autoIntercept) return;
 
     const isKnownGeminiBlob        = item.url.startsWith('blob:') && GEMINI_HOSTS.some(h => item.url.includes(h));
@@ -252,7 +287,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
   if (port.name === 'uai-popup') {
     popupPorts.add(port);
-    // v4.0.6: refresh from offscreen first, then push to the new popup.
+    // Refresh from offscreen first, then push to the new popup.
     refreshModelStateFromOffscreen().then(() => {
       try { port.postMessage({ type: 'modelStatus', ...modelLoadState }); } catch {}
     });
@@ -333,7 +368,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return false;
 
     case 'getModelStatus':
-      // v4.0.6: spawn-and-settle pattern. If offscreen isn't running yet, we
+      // Spawn-and-settle pattern. If offscreen isn't running yet, we
       // ensureOffscreen() (triggers spawn + boot IIFE), then wait briefly for
       // its boot to detect cache + push a state update. This eliminates the
       // false "Model not downloaded" the popup used to flash on new tabs
@@ -367,6 +402,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         .catch(e => sendResponse({ ok: false, error: e.message }));
       return true;
 
+    case 'cancelModelDownload':
+      offscreenSend('cancelDownload')
+        .then(r => sendResponse(r || { ok: true }))
+        .catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
     case 'preWarmModel':
       if (modelLoadState.status === 'idle' || modelLoadState.status === 'error') {
         offscreenSend('warmup').catch(e => console.warn('[UAI bg] pre-warm failed:', e.message));
@@ -379,25 +420,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true });
       return false;
 
-    case 'setAutoIntercept':
-      cachedSettings.autoIntercept = !!msg.autoIntercept;
-      sendResponse({ ok: true });
-      return false;
-
     case 'downloadClean': {
-      pendingCleanDownloads++;
-      // v4.0.1: prefer blobUrl (cheap IPC); fall back to dataUrl for compat
+      // Prefer blobUrl (cheap IPC); fall back to dataUrl for compat.
       const url = msg.blobUrl || msg.dataUrl;
       if (!url) {
-        pendingCleanDownloads = Math.max(0, pendingCleanDownloads - 1);
         sendResponse({ ok: false, error: 'No url or blobUrl provided' });
         return false;
       }
+      // Register BEFORE calling chrome.downloads.download so onCreated (which
+      // fires synchronously-ish inside Chrome) can recognise it as ours.
+      ourDownloadUrls.add(url);
+      // Safety: if the download never produces an onCreated event (rare: user
+      // cancelled before the chooser, or another extension intercepted), the
+      // Set entry would live forever. Expire after 60s.
+      setTimeout(() => ourDownloadUrls.delete(url), 60_000);
+
       chrome.downloads.download(
         { url, filename: msg.filename, saveAs: false, conflictAction: 'uniquify' },
         (downloadId) => {
           if (chrome.runtime.lastError || !downloadId) {
-            pendingCleanDownloads = Math.max(0, pendingCleanDownloads - 1);
+            ourDownloadUrls.delete(url);
             sendResponse({ ok: false, error: chrome.runtime.lastError?.message || 'Download failed' });
           } else {
             sendResponse({ ok: true, downloadId });
@@ -421,36 +463,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return true;
 
     case 'watermarkRemoved':
-      sessionCount++;
       chrome.storage.sync.get('stats', ({ stats }) => {
         chrome.storage.sync.set({
-          stats: { totalRemoved: (stats?.totalRemoved || 0) + 1, lastReset: stats?.lastReset || Date.now() },
+          stats: {
+            totalRemoved: (stats?.totalRemoved || 0) + 1,
+            lastReset: stats?.lastReset || Date.now(),
+          },
         });
       });
-      updateBadgeCount();
-      sendResponse({ ok: true, sessionCount });
-      return false;
-
-    case 'toggleEnabled':
-      chrome.storage.sync.get('settings', ({ settings }) => {
-        const updated = { ...settings, enabled: msg.enabled };
-        chrome.storage.sync.set({ settings: updated }, () => {
-          Object.assign(cachedSettings, updated);
-          updateBadge(msg.enabled);
-          sendResponse({ ok: true });
-        });
-      });
-      return true;
-
-    case 'getSession':
-      sendResponse({ sessionCount });
+      incrementDailyStat().catch(() => {});
+      sendResponse({ ok: true });
       return false;
   }
 });
 
-// v4.0.9: badge now reflects the current engine (QCK / PRO), not a session
-// count. The popup shows the count already; the badge as a method indicator
-// gives a glanceable cue of which engine is active.
+// Badge reflects the current engine (QCK / PRO), not a count. The popup shows
+// stats already; the badge as a method indicator gives a glanceable cue of
+// which engine is active.
 function methodLabel(method) {
   return method === 'ai' ? 'PRO' : 'QCK';
 }
@@ -464,10 +493,6 @@ function refreshBadge() {
   }
   setIconVariant(on);
 }
-
-// Kept as a thin alias so the old call sites keep working without bigger refactor.
-function updateBadge(_on) { refreshBadge(); }
-function updateBadgeCount() { /* deprecated v4.0.9 — badge shows method now */ }
 
 function setBadge(text, color) {
   chrome.action.setBadgeText({ text });
@@ -485,4 +510,4 @@ function setIconVariant(active) {
   }).catch(() => {});
 }
 
-console.log('[UAI bg] service worker booted v4.0.4 (offscreen ORT)');
+console.log('[UAI bg] service worker booted');

@@ -15,7 +15,7 @@
   /* Text */
   --text-primary:   #FAFAFA;
   --text-secondary: #A1A1AA;
-  --text-muted:     #71717A;
+  --text-muted:     #8E8E96;  /* was #71717A — bumped to ~6.1:1 on bg-base for WCAG AA on 11px labels */
   --text-disabled:  #52525B;
 
   /* Accent */
@@ -34,10 +34,83 @@
   --radius-sm: 6px;
   --radius-lg: 10px;
 
+  /* Component tokens */
+  --switch-rail-off:  #2A2B30;
+  --switch-thumb-off: #E4E4E7;
+
   /* Type */
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Display',
                'Segoe UI', Inter, system-ui, 'Helvetica Neue', Arial, sans-serif;
   --font-mono: ui-monospace, 'SF Mono', Menlo, Monaco, Consolas, monospace;
+}
+
+/* ── Light theme ──────────────────────────────────────────────────── *
+ * Activates automatically for users with OS/browser light preference.
+ * The accent, state colors, and semantic tokens keep the same hues —
+ * only surfaces and text are inverted. All component selectors below
+ * reference these vars so no duplication is needed.
+ */
+@media (prefers-color-scheme: light) {
+  :root {
+    /* Surfaces — inverted */
+    --bg-base:      #FFFFFF;
+    --bg-card:      #FAFAFA;
+    --bg-elevated:  #F4F4F5;
+    --bg-hover:     #EEEEEF;
+    --border:       #E4E4E7;
+    --border-strong:#D4D4D8;
+
+    /* Text — inverted, kept above AA contrast */
+    --text-primary:   #18181B;
+    --text-secondary: #3F3F46;
+    --text-muted:     #52525B;  /* ≥7:1 on light bg */
+    --text-disabled:  #A1A1AA;
+
+    /* Accent soft gets a higher alpha so the tint reads against white */
+    --accent-soft:  rgba(20, 184, 166, 0.12);
+    --accent-ring:  rgba(20, 184, 166, 0.35);
+
+    /* Switch: rail visible as a pale gray, thumb visible as pure white */
+    --switch-rail-off:  #D4D4D8;
+    --switch-thumb-off: #FFFFFF;
+  }
+
+  /* A few overrides that can't be reduced to tokens */
+  .engine-card.active {
+    /* Stronger tint visibly pops on white too */
+    background: rgba(20, 184, 166, 0.12);
+  }
+  .engine-card.active::after {
+    /* Match the new card bg for the cut-out ring effect */
+    box-shadow: 0 0 0 3px var(--bg-card);
+  }
+  .switch-thumb {
+    /* Soften the shadow since the base isn't dark anymore */
+    box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  }
+  .img-card-overlay {
+    /* Overlay still needs to darken the image for button legibility */
+    background: linear-gradient(to top, rgba(0,0,0,0.8) 0%, rgba(0,0,0,0.3) 50%, transparent 100%);
+  }
+  .popup-toast {
+    box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+  }
+  .ms-details-btn {
+    background: rgba(0, 0, 0, 0.04);
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+  .ms-details-btn:hover {
+    background: rgba(0, 0, 0, 0.07);
+    border-color: rgba(0, 0, 0, 0.16);
+  }
+  .img-original-link {
+    background: rgba(0, 0, 0, 0.05);
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+  .img-original-link:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.08);
+    border-color: rgba(0, 0, 0, 0.16);
+  }
 }
 
 /* ── Reset ───────────────────────────────────────────────────────── */
@@ -78,6 +151,31 @@ a { color: inherit; text-decoration: none; }
   height: 1px;
   overflow: hidden;
   clip: rect(0,0,0,0);
+}
+
+/* ── Focus rings ─────────────────────────────────────────────────── *
+ * Keyboard-only focus outline (:focus-visible skips mouse clicks).
+ * Switches use the pre-existing box-shadow on .switch-rail further
+ * down — everything else gets a uniform outline here so keyboard
+ * users can see where they are.
+ */
+.engine-card:focus-visible,
+.btn:focus-visible,
+.img-clean-btn:focus-visible,
+.img-original-link:focus-visible,
+.footer-link:focus-visible,
+.ms-retry:focus-visible {
+  outline: 2px solid var(--accent-hover);
+  outline-offset: 2px;
+}
+/* Remove the browser's default outline when the custom one is in play */
+.engine-card:focus,
+.btn:focus,
+.img-clean-btn:focus,
+.img-original-link:focus,
+.footer-link:focus,
+.ms-retry:focus {
+  outline: none;
 }
 
 /* ── Header ──────────────────────────────────────────────────────── */
@@ -156,7 +254,7 @@ body.paused .brand-name { color: var(--text-secondary); }
 .switch-rail {
   position: absolute;
   inset: 0;
-  background: #2A2B30;
+  background: var(--switch-rail-off);
   border-radius: 999px;
   transition: background 180ms ease;
 }
@@ -166,7 +264,7 @@ body.paused .brand-name { color: var(--text-secondary); }
   left: 2px;
   width: 16px;
   height: 16px;
-  background: #E4E4E7;
+  background: var(--switch-thumb-off);
   border-radius: 999px;
   transition: transform 180ms cubic-bezier(.4,0,.2,1), background 180ms ease;
   box-shadow: 0 1px 2px rgba(0,0,0,.4);
@@ -185,6 +283,73 @@ body.paused .brand-name { color: var(--text-secondary); }
 .switch-sm { width: 32px; height: 18px; }
 .switch-sm .switch-thumb { width: 14px; height: 14px; }
 .switch-sm input:checked ~ .switch-rail .switch-thumb { transform: translateX(14px); }
+
+/* ── Onboarding welcome banner (first-run only) ──────────────────── *
+ * Displays between header and stats when totalRemoved === 0 and not
+ * dismissed. Auto-hides after the first successful clean.
+ */
+.welcome {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px;
+  background: linear-gradient(135deg, var(--accent-soft) 0%, transparent 80%);
+  border-bottom: 1px solid var(--border);
+  animation: uai-welcome-in 280ms cubic-bezier(.4,0,.2,1);
+}
+.welcome[hidden] { display: none; }
+.welcome-icon {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1;
+}
+.welcome-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.welcome-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+.welcome-body {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+.welcome-dismiss {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+.welcome-dismiss:hover {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+@keyframes uai-welcome-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
 
 /* ── Stats ───────────────────────────────────────────────────────── */
 .stats {
@@ -261,14 +426,34 @@ body.paused .brand-name { color: var(--text-secondary); }
 }
 .engine-card:active { transform: scale(0.985); }
 .engine-card.active {
-  background: var(--accent-soft);
+  background: rgba(20, 184, 166, 0.14);   /* stronger tint — was --accent-soft 0.10 */
   border-color: var(--accent);
+  /* Inset 1px shadow doubles the border feel without reflowing the grid */
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 .engine-card.active .engine-icon {
   background: var(--accent);
   color: #FFFFFF;
 }
 .engine-card.active .engine-name { color: var(--text-primary); }
+
+/* Active-state corner dot: unmistakable selection indicator.
+ * Sits at top-right. For the Pro card, the engine-badge (download %)
+ * uses a higher z-index and will cover the dot during downloads. */
+.engine-card.active::after {
+  content: '';
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  background: var(--accent);
+  border-radius: 50%;
+  /* The "ring" effect that lifts the dot off the card background */
+  box-shadow: 0 0 0 3px var(--bg-card);
+  z-index: 1;
+}
+.engine-badge { z-index: 2; }
 
 .engine-icon {
   width: 24px;
@@ -312,6 +497,101 @@ body.paused .brand-name { color: var(--text-secondary); }
   font-variant-numeric: tabular-nums;
 }
 .engine-badge[hidden] { display: none; }
+
+/* ── Engine info expander ─────────────────────────────────────────── *
+ * Sits under the engine grid. Helps users decide between Quick and Pro
+ * before they commit to the 198 MB Pro download. Toggles an inline
+ * comparison panel so there's no modal interruption.
+ */
+.engine-info-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+  width: 100%;
+  justify-content: center;
+}
+.engine-info-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.engine-info-toggle[aria-expanded="true"] {
+  background: var(--bg-card);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+.engine-info-toggle svg {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+.engine-info-toggle:hover svg,
+.engine-info-toggle[aria-expanded="true"] svg { color: var(--accent); }
+
+.engine-info-panel {
+  margin-top: 8px;
+  padding: 12px 12px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 12px;
+  animation: uai-welcome-in 200ms cubic-bezier(.4,0,.2,1);
+}
+.engine-info-panel[hidden] { display: none; }
+
+.eip-col-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+.eip-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.eip-list li {
+  position: relative;
+  padding-left: 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+.eip-list li::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.eip-note {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
 
 /* ── Model status panel ─────────────────────────────────────────── */
 .model-status {
@@ -406,6 +686,58 @@ body.paused .brand-name { color: var(--text-secondary); }
   flex-shrink: 0;
 }
 .ms-retry:hover { background: rgba(20,184,166,0.18); }
+
+/* Cancel variant — red tint so the user reads it as destructive, not
+ * retry/continue. Reuses .ms-retry's shape to stay consistent. */
+.ms-retry.ms-cancel {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.25);
+}
+.ms-retry.ms-cancel:hover {
+  background: rgba(239, 68, 68, 0.16);
+}
+.ms-retry.ms-cancel:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Inline error disclosure — replaces title= tooltip which clips awkwardly
+ * in a popup pinned to the Chrome toolbar. "Show details" button sits under
+ * the short error; clicking swaps it out for a monospace full-message block. */
+.ms-details-btn {
+  align-self: flex-start;
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+.ms-details-btn:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--text-primary);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+.ms-details-full {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(239, 68, 68, 0.18);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}
 
 /* ── Row (generic toggle row) ────────────────────────────────────── */
 .row {
@@ -678,6 +1010,26 @@ body.manual-mode .row-desc { color: var(--amber); opacity: 0.85; }
   100% { transform: scale(1); }
 }
 
+/* ── Privacy note (transparency line above footer) ──────────────── */
+.privacy-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-base);
+  border-top: 1px solid var(--border);
+  letter-spacing: 0.01em;
+}
+.privacy-note .privacy-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+  opacity: 0.75;
+}
+
 /* ── Footer ──────────────────────────────────────────────────────── */
 .footer {
   display: flex;
@@ -691,9 +1043,32 @@ body.manual-mode .row-desc { color: var(--amber); opacity: 0.85; }
   font-size: 11px;
   color: var(--text-muted);
   font-weight: 500;
-  transition: color 140ms ease;
+  transition: color 140ms ease, background 140ms ease;
 }
 .footer-link:hover { color: var(--text-secondary); }
+
+/* Two-step confirmation state for the Reset Stats button. First click enters
+ * this state for 3s; a second click commits. Prevents accidental wipes. */
+.footer-link.confirming {
+  color: var(--amber);
+  font-weight: 600;
+}
+.footer-link.confirming::after {
+  content: '';
+  display: inline-block;
+  width: 24px;
+  height: 2px;
+  margin-left: 6px;
+  vertical-align: middle;
+  background: var(--amber);
+  border-radius: 999px;
+  transform-origin: left center;
+  animation: uai-confirm-countdown 3s linear forwards;
+}
+@keyframes uai-confirm-countdown {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
 .footer-version {
   font-size: 10px;
   color: var(--text-disabled);
@@ -735,3 +1110,229 @@ body.manual-mode .row-desc { color: var(--amber); opacity: 0.85; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-disabled); }
+
+/* ── Reduced motion ──────────────────────────────────────────────── *
+ * Users with vestibular/motion sensitivity get near-instant
+ * transitions instead of the bump/pop/spin/indeterminate animations.
+ * We don't drop animations entirely (tiny crossfades still help
+ * legibility) — we just collapse their duration so they're not
+ * perceived as motion.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Before/After preview modal ──────────────────────────────────── *
+ * Opened when the user clicks "Compare" on a successfully-cleaned
+ * image card. Overlays the whole popup; closing restores normal view.
+ */
+.preview-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+}
+.preview-modal[hidden] { display: none; }
+
+.preview-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  animation: uai-pv-fade 160ms ease-out;
+}
+
+.preview-sheet {
+  position: relative;
+  margin: auto;
+  width: 308px;                 /* popup is 340px wide, 16px gutter each side */
+  max-height: calc(100vh - 32px);
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  animation: uai-pv-sheet-in 200ms cubic-bezier(.4,0,.2,1);
+}
+
+.preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.preview-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.01em;
+}
+.preview-close {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+.preview-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+.preview-stage {
+  position: relative;
+  background: var(--bg-base);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  min-height: 160px;
+}
+.preview-loading {
+  padding: 40px 20px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.preview-slider {
+  position: relative;
+  width: 100%;
+  --split: 50%;                 /* updated by JS pointer drag */
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;           /* let our pointer events win on touch */
+}
+.preview-slider[hidden] { display: none; }
+
+.preview-img {
+  width: 100%;
+  height: auto;
+  display: block;
+  pointer-events: none;         /* drag hits the slider, not the img */
+}
+.preview-clip {
+  position: absolute;
+  inset: 0;
+  /* clip-path reveals only the left portion of the original. Right side is
+   * fully clipped by 100% - split. At split=50%, clips right half → left
+   * half of the original remains visible over the cleaned base. */
+  clip-path: inset(0 calc(100% - var(--split)) 0 0);
+  overflow: hidden;
+}
+
+.preview-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--split);
+  width: 1px;
+  background: rgba(255, 255, 255, 0.85);
+  transform: translateX(-0.5px);
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.4);
+  cursor: ew-resize;
+}
+.preview-handle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  background: rgba(255, 255, 255, 0.95);
+  color: #18181B;
+  border-radius: 999px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+  cursor: ew-resize;
+}
+.preview-handle-arrow {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  color: #18181B;
+}
+
+.preview-badge {
+  position: absolute;
+  top: 6px;
+  padding: 2px 6px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #FAFAFA;
+  background: rgba(0, 0, 0, 0.65);
+  border-radius: 3px;
+  pointer-events: none;
+}
+.preview-badge-orig  { left: 6px; }
+.preview-badge-clean { right: 6px; }
+
+.preview-hint {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-align: center;
+  letter-spacing: 0.01em;
+}
+
+@keyframes uai-pv-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes uai-pv-sheet-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Light-theme tweaks for the modal */
+@media (prefers-color-scheme: light) {
+  .preview-backdrop { background: rgba(0, 0, 0, 0.35); }
+  .preview-divider  { background: rgba(0, 0, 0, 0.7); }
+  .preview-handle   { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+}
+
+/* The Compare button that lives inside a grid card's overlay (added by JS
+ * after a successful clean, alongside "View original"). Shares the same
+ * ghost styling as .img-original-link so they stack naturally. */
+.img-compare-link {
+  align-self: stretch;
+  margin-top: 4px;
+  padding: 4px 6px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--accent);
+  background: rgba(20, 184, 166, 0.10);
+  border: 1px solid rgba(20, 184, 166, 0.25);
+  border-radius: var(--radius-sm);
+  text-align: center;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+.img-compare-link:hover:not(:disabled) {
+  background: rgba(20, 184, 166, 0.16);
+  color: var(--accent-hover);
+  border-color: rgba(20, 184, 166, 0.40);
+}
+.img-compare-link:disabled { cursor: default; opacity: 0.7; }

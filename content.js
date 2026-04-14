@@ -1,5 +1,5 @@
 /**
- * UnmarkAI v4.0.9 — ISOLATED WORLD Content Script
+ * UnmarkAI — ISOLATED WORLD Content Script
  *
  * Has access to Chrome APIs but cannot intercept page JS (that's main-world.js).
  * Communicates with main-world.js via window.postMessage.
@@ -12,23 +12,24 @@
  *   • Report stats to background service worker
  *
  * METHODS (cfg.method):
- *   smart    — Inverse-distance-weighted fill with Gaussian texture noise (default)
- *   fill     — Detect sparkle region, fill by copying pixels from directly above
- *   crop     — Trim the bottom 8 % of the image (removes badge + sparkle entirely)
- *   strip    — Re-encode only; destroys SynthID, no visible-watermark removal
+ *   smart  — PatchMatch exemplar inpainting + IDW fill + Gauss-Seidel seam
+ *            smoothing. Fully algorithmic, runs in-page, near-instant.
+ *   ai     — LaMa neural inpainting via ONNX Runtime (runs in offscreen doc,
+ *            ~30–40 s per image, best quality).
  *
- * CHANGES v3.4 → v3.5 (blob:null fix):
- *   ROOT CAUSE: Gemini creates image blobs in a sandboxed iframe (null origin).
- *   These produce blob:null/uuid URLs. Chrome BLOCKS fetch() of blob:null URLs
- *   from isolated-world content scripts with "URL scheme blob is not supported".
- *   TWO-PART FIX:
- *   1. GWR_BLOB now accepts a pre-converted dataUrl string (sent by main-world
- *      via FileReader) instead of a Blob object. fetch(dataUrl) always works.
- *   2. fetchImage now has a multi-stage fallback chain: cached dataUrl →
- *      cached Blob → data: URL → blob: URL (try/catch) → HTTPS via background
- *      → imgHint HTTPS URL passed from main-world → DOM scan for page images.
- *      The last two stages handle blob:null definitively by using the same
- *      HTTPS URL that the manual scan uses (which always works).
+ *   All outputs go through a SynthID-disruption pass: Gaussian noise (σ=1.5) +
+ *   JPEG round-trip at Q=0.88. Final encoding is PNG.
+ *
+ * BLOB:NULL NOTES:
+ *   Gemini creates image blobs in a sandboxed iframe (null origin), producing
+ *   blob:null/uuid URLs. Chrome BLOCKS fetch() of blob:null URLs from
+ *   isolated-world content scripts. The fix is two-part:
+ *     1. GWR_BLOB accepts a pre-converted dataUrl string (sent by main-world
+ *        via FileReader). fetch(dataUrl) always works.
+ *     2. fetchImage has a multi-stage fallback chain: cached dataUrl →
+ *        cached Blob → data: URL → blob: URL (same-origin only) → HTTPS via
+ *        background → imgHint HTTPS URL passed from main-world → DOM scan for
+ *        page images.
  */
 
 (function () {
@@ -37,15 +38,12 @@
   const TAG = '[UAI-iso]';
 
   // ── Settings ───────────────────────────────────────────────────────────────
+  // Only these three are user-controllable. Output format is always PNG, visible
+  // watermark + SynthID removal are always on, notifications are always on.
   let cfg = {
-    enabled:           true,
-    autoIntercept:     true,   // v3.8 — when false, auto-intercept is disabled (manual mode)
-    removeVisible:     true,
-    removeSynthID:     true,
-    method:            'smart',
-    format:            'png',
-    jpegQuality:       0.96,   // v3.3 — user-configurable
-    showNotifications: true,
+    enabled:       true,
+    autoIntercept: true,   // when false, auto-intercept is off (manual-only mode)
+    method:        'smart',
   };
 
   // ── Boot ───────────────────────────────────────────────────────────────────
@@ -67,12 +65,12 @@
 
     syncSettings();
     installMessageBridge();
-    installSpaNavigationCleanup();  // v4.0.1 — clear stale image hints on Gemini SPA nav
+    installSpaNavigationCleanup();  // clear stale image hints on Gemini SPA nav
     preWarmLaMa();  // trigger model load immediately if AI method is already set
     log('ISOLATED world ready on', window.location.hostname);
   })();
 
-  // v4.0.1 — Gemini is a SPA. Stale uaiClickedSrc/uaiHoveredSrc dataset values
+  // Gemini is a SPA. Stale uaiClickedSrc/uaiHoveredSrc dataset values
   // can persist across chats and cause the next download to grab a wrong image.
   // Hook history.pushState/replaceState/popstate to clear them on every nav.
   function installSpaNavigationCleanup() {
@@ -97,7 +95,7 @@
     window.addEventListener('popstate', clearImageHints);
   }
 
-  // v4.0.1 — Send blob to background via short-lived blob URL instead of
+  // Send blob to background via short-lived blob URL instead of
   // base64 data URL through sendMessage. For a 4 MB cleaned PNG this drops
   // a ~5.5 MB IPC payload to ~50 bytes — major perf win + dodges the IPC
   // size cliff for very large images.
@@ -122,17 +120,23 @@
     window.postMessage({
       gwrType:       'GWR_SETTINGS',
       enabled:       cfg.enabled,
-      autoIntercept: cfg.autoIntercept !== false, // v3.8 — default true
+      autoIntercept: cfg.autoIntercept !== false, // default true
     }, '*');
   }
 
-  // v4.0.8: Originals cache for the "View original" feature.
+  // Originals cache for the "View original" feature.
   // Each clean operation registers the unprocessed image so the user can
   // download it as a fallback if the AI output isn't what they wanted.
   // LRU-bounded + 5-minute TTL — won't accumulate across long Gemini sessions.
   const ORIGINALS_MAX = 12;
   const ORIGINALS_TTL = 5 * 60_000;  // 5 minutes
   const originalsCache = new Map();   // id → { blob, filename, ts }
+
+  // Parallel cache for cleaned output, keyed by the SAME id as the original.
+  // Stores a downscaled JPEG (max 800px) so the before/after preview modal
+  // can load both images cheaply. Full-res cleaned blob has already been
+  // saved to disk by the time we get here; we only need enough for preview.
+  const cleanedCache = new Map();     // id → { blob, ts }
 
   function registerOriginal(rawBlob, filename) {
     const id = 'o_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
@@ -145,6 +149,39 @@
     // Auto-expire
     setTimeout(() => originalsCache.delete(id), ORIGINALS_TTL);
     return id;
+  }
+
+  // Downscale an image blob to a JPEG at max dimension, for preview use.
+  // JPEG chosen over PNG because previews are photographic and JPEG at 0.88
+  // is typically 5-10× smaller than PNG with no perceptible quality loss.
+  async function downscaleToJpeg(blob, maxWidth = 800, quality = 0.88) {
+    const bitmap = await createImageBitmap(blob);
+    const w = Math.min(maxWidth, bitmap.width);
+    const h = Math.round(bitmap.height * (w / bitmap.width));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
+    return new Promise((res, rej) =>
+      canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob failed')), 'image/jpeg', quality)
+    );
+  }
+
+  // Fire-and-forget: immediately after a clean succeeds, stash a downscaled
+  // JPEG preview keyed to the same id as the original. Failures are logged
+  // but never propagate — the Compare feature is best-effort.
+  async function cacheCleanedPreview(id, cleanBlob) {
+    try {
+      const preview = await downscaleToJpeg(cleanBlob, 800, 0.88);
+      cleanedCache.set(id, { blob: preview, ts: Date.now() });
+      while (cleanedCache.size > ORIGINALS_MAX) {
+        const oldest = cleanedCache.keys().next().value;
+        cleanedCache.delete(oldest);
+      }
+      setTimeout(() => cleanedCache.delete(id), ORIGINALS_TTL);
+    } catch (e) {
+      log('Cleaned-preview cache failed:', e.message);
+    }
   }
 
   async function downloadOriginal(id) {
@@ -175,7 +212,7 @@
   // intercept and the popup manual-download trigger simultaneously).
   const processingUrls = new Set();
 
-  // ── v3.5: Image data cache ─────────────────────────────────────────────────
+  // ── Image data cache ─────────────────────────────────────────────────
   const blobCache = new Map(); // blobUrl → data URL string or Blob
 
 
@@ -183,39 +220,59 @@
    * Open a persistent port to background.js, send the crop, and wait for the
    * inpainted 512×512 result. The port keeps the service worker alive for the
    * full duration of LaMa inference — no timeout, no dropped connections.
+   *
+   * Pass an AbortSignal to make the operation cancelable. On abort we
+   * disconnect the port (the offscreen inference keeps running to completion
+   * but its result is discarded) and reject with an AbortError.
    */
-  function lamaInpaintViaBackground({ cropPixels, cropW, cropH, softMask }) {
+  function lamaInpaintViaBackground({ cropPixels, cropW, cropH, softMask, signal }) {
     return new Promise((resolve, reject) => {
       let port;
+      let settled = false;
 
-      // Open port — this prevents the service worker from being killed
       try {
         port = chrome.runtime.connect({ name: 'lama-inpaint' });
       } catch (e) {
         return reject(new Error('Could not connect to background: ' + e.message));
       }
 
+      const cleanup = () => {
+        settled = true;
+        if (signal) signal.removeEventListener('abort', onAbort);
+        try { port.disconnect(); } catch {}
+      };
+
+      const onAbort = () => {
+        if (settled) return;
+        cleanup();
+        const err = new Error('Cancelled');
+        err.cancelled = true;
+        reject(err);
+      };
+
+      if (signal) {
+        if (signal.aborted) { onAbort(); return; }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
       // Handle messages from background
       port.onMessage.addListener((msg) => {
+        if (settled) return;
         if (msg.type === 'progress') {
-          // Forward progress to page toast so user sees something is happening
           toast(msg.msg, 'info');
           log('bg:', msg.msg);
           return;
         }
-
         if (msg.type === 'result') {
-          port.disconnect(); // Release the service worker
-          if (msg.ok) {
-            resolve(msg.inpainted512);
-          } else {
-            reject(new Error(msg.error || 'inference failed'));
-          }
+          cleanup();
+          if (msg.ok) resolve(msg.inpainted512);
+          else        reject(new Error(msg.error || 'inference failed'));
         }
       });
 
-      // If the port disconnects unexpectedly (e.g. extension reloaded)
       port.onDisconnect.addListener(() => {
+        if (settled) return;
+        settled = true;
         const err = chrome.runtime.lastError?.message || 'Port disconnected unexpectedly';
         reject(new Error(err));
       });
@@ -294,7 +351,7 @@
           break;
         }
 
-        // v3.5: main-world now sends a pre-converted data URL string (not a Blob)
+        // main-world now sends a pre-converted data URL string (not a Blob)
         case 'GWR_BLOB': {
           const { url, dataUrl, blob } = e.data;
           const cached = (typeof dataUrl === 'string' && dataUrl.startsWith('data:'))
@@ -325,7 +382,7 @@
     });
   }
 
-  // v3.5: imgHint param — HTTPS URL from a nearby <img> on the page,
+  // imgHint param — HTTPS URL from a nearby <img> on the page,
   // used as fallback when the download URL is a blob:null we cannot fetch.
   async function processIntercept(url, filename, cachedData = null, imgHint = null) {
     if (processingUrls.has(url)) {
@@ -334,18 +391,20 @@
     }
     processingUrls.add(url);
 
-    // v4.0.7: persistent progress card for Pro mode (long wait).
-    // Quick mode is fast enough that the existing toast is sufficient.
+    // Persistent progress card for Pro mode (long wait). Smart mode is fast
+    // enough that the existing toast is sufficient.
     const usePro = (cfg.method === 'ai');
-    const card = (usePro && cfg.showNotifications) ? showProgressCard() : null;
+    const abortCtrl = usePro ? new AbortController() : null;
+    const card = usePro
+      ? showProgressCard({ onCancel: abortCtrl ? () => abortCtrl.abort() : null })
+      : null;
     if (!card) toast('Removing watermark…', 'info');
 
     try {
       const rawBlob   = await fetchImage(url, cachedData, imgHint);
-      const cleanBlob = await processImage(rawBlob);
+      const cleanBlob = await processImage(rawBlob, abortCtrl?.signal);
 
-      // v4.0.1: send blob via blob URL instead of giant base64 data URL.
-      // Old base64-through-sendMessage path was the perf bottleneck on large images.
+      // Send blob via blob URL instead of giant base64 data URL (cheap IPC).
       await downloadBlobViaBackground(cleanBlob, filename);
 
       await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
@@ -353,25 +412,34 @@
       delete document.documentElement.dataset.uaiClickedSrc;
       delete document.documentElement.dataset.uaiClickedTime;
 
-      // v4.0.8: cache the original so user can fall back to it if AI result
-      // isn't what they wanted. Available via "Download original" link in card.
+      // Cache the original so user can fall back to it if the AI result isn't
+      // what they wanted. Available via the "Download original" link in card.
       const originalId = registerOriginal(rawBlob, filename);
+      // Also cache a downscaled cleaned preview for the before/after modal.
+      cacheCleanedPreview(originalId, cleanBlob);
 
       if (card) card.success('Watermark removed · Saved', { originalId });
       else      toast('Watermark removed ✓', 'success');
       log('Processed:', filename);
     } catch (err) {
-      log('Processing error:', err.message);
-      if (card) card.error(err.message || 'Processing failed');
-      else      toast('Processing failed — downloading original', 'error');
-      window.postMessage({ gwrType: 'GWR_FALLBACK', url, filename }, '*');
+      if (err.cancelled) {
+        log('Cancelled by user:', filename);
+        if (card) card.cancelled('You cancelled this clean');
+        // On cancel, don't fall back to native download — the user asked
+        // us to stop, so stop. They can download manually if they want.
+      } else {
+        log('Processing error:', err.message);
+        if (card) card.error(err.message || 'Processing failed');
+        else      toast('Processing failed — downloading original', 'error');
+        window.postMessage({ gwrType: 'GWR_FALLBACK', url, filename }, '*');
+      }
     } finally {
       processingUrls.delete(url);
       blobCache.delete(url);
     }
   }
 
-  // ── Image Fetch — v3.5 multi-stage fallback chain ─────────────────────────
+  // ── Image Fetch — multi-stage fallback chain ─────────────────────────
   //
   //  Stage 1: cached data URL string (pre-converted by main-world FileReader)
   //  Stage 2: cached Blob object (legacy GWR_BLOB path)
@@ -452,7 +520,7 @@
     //   4. findBestPageImageUrl() — DOM scan (last resort, often latest image)
     const clickedSrc  = document.documentElement.dataset.uaiClickedSrc  || null;
     const clickedTime = parseInt(document.documentElement.dataset.uaiClickedTime || '0', 10);
-    // v4.0.1: 15-second window (was 60s). Combined with SPA navigation cleanup,
+    // 15-second window (was 60s). Combined with SPA navigation cleanup,
     // this prevents stale clicks from earlier chats grabbing the wrong image.
     const clickHint   = (clickedSrc && Date.now() - clickedTime < 15000) ? clickedSrc : null;
 
@@ -490,7 +558,7 @@
   // Uses the SAME URL patterns as __UAI_scanImages so it always matches
   // whatever __UAI_scanImages finds (manual scan = direct download = same logic).
   //
-  // v3.6 FIX: only skip blob:null (sandboxed-iframe, truly inaccessible).
+  // only skip blob:null (sandboxed-iframe, truly inaccessible).
   // blob:https://gemini.google.com/uuid are same-origin blobs — content scripts
   // CAN fetch them (Stage 4), and they're what Gemini uses for <img src>.
   // The old "skip all blob:" was why the fallback always returned null.
@@ -524,7 +592,7 @@
     return null;
   }
 
-  // ── v3.8: SynthID Removal — Gaussian noise + internal JPEG round-trip ────────
+  // ── SynthID Removal — Gaussian noise + internal JPEG round-trip ────────
   //
   // PROBLEM with the old approach: canvas re-encode to PNG is lossless —
   // pixel values are UNCHANGED, so any frequency-domain fingerprint (SynthID)
@@ -585,7 +653,7 @@
   }
 
 
-  // ── v3.8: AI Method — LaMa Neural Inpainting ─────────────────────────────────
+  // ── AI Method — LaMa Neural Inpainting ─────────────────────────────────
   //
 
   /**
@@ -636,8 +704,12 @@
   //   5. Worker composites result back at original resolution
   //   6. Apply synthIdStrip() (noise + JPEG round-trip)
   //   7. Encode final blob in user's chosen format
-  async function processImageAI(blob) {
+  async function processImageAI(blob, signal) {
     toast('Preparing AI inpainting…', 'info');
+
+    if (signal?.aborted) {
+      const e = new Error('Cancelled'); e.cancelled = true; throw e;
+    }
 
     let bitmap;
     try {
@@ -655,7 +727,8 @@
     ctx.drawImage(bitmap, 0, 0);
     bitmap.close();
 
-    if (cfg.removeVisible) {
+    // Visible-watermark removal — always on for AI mode.
+    {
       const fullImgData = ctx.getImageData(0, 0, W, H);
       const { data } = fullImgData;
 
@@ -732,6 +805,7 @@
             cropW,
             cropH,
             softMask,
+            signal,
           });
 
           compositeInpainted(ctx, inpainted512, cropX, cropY, cropW, cropH, softMask);
@@ -739,9 +813,10 @@
           toast('AI inpainting done ✓', 'success');
 
         } catch (lamaErr) {
+          if (lamaErr.cancelled) throw lamaErr;  // bubble cancellation up
           log('failed, falling back to Smart:', lamaErr.message);
           toast('AI failed — using Smart fallback', 'error');
-          removeVisibleWatermark(ctx, W, H, 'smart');
+          removeVisibleWatermark(ctx, W, H);
         }
 
       } else {
@@ -749,26 +824,23 @@
       }
     }
 
-    // SynthID removal (always applied in AI mode)
-    if (cfg.removeSynthID) {
-      await synthIdStrip(canvas, ctx, W, H);
-    }
+    // SynthID disruption: always applied.
+    await synthIdStrip(canvas, ctx, W, H);
 
-    const mime = cfg.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-    const qual = cfg.format === 'jpeg' ? (cfg.jpegQuality ?? 0.96) : undefined;
     return new Promise((res, rej) =>
-      canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), mime, qual)
+      canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), 'image/png')
     );
   }
 
 
   // ── Image Processing Pipeline ──────────────────────────────────────────────
-  async function processImage(blob) {
-    // v3.8: Route AI method to LaMa neural inpainting (entirely separate path)
+  async function processImage(blob, signal) {
+    // Route AI method to LaMa neural inpainting (entirely separate path)
     if (cfg.method === 'ai') {
-      return processImageAI(blob);
+      return processImageAI(blob, signal);
     }
 
+    // Smart path (algorithmic PatchMatch inpainting).
     let bitmap;
     try {
       bitmap = await createImageBitmap(blob);
@@ -777,58 +849,36 @@
     }
 
     const W = bitmap.width, H = bitmap.height;
-    log('Processing', W, '×', H, '| method:', cfg.method, '| format:', cfg.format);
+    log('Processing', W, '×', H, '| method: smart');
 
     const canvas = document.createElement('canvas');
     const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+    canvas.width  = W;
+    canvas.height = H;
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
 
-    // ── CROP: trim bottom 8 % ─────────────────────────────────────────────
-    if (cfg.method === 'crop') {
-      const cropH = Math.floor(H * 0.92);
-      canvas.width  = W;
-      canvas.height = cropH;
-      ctx.drawImage(bitmap, 0, 0, W, cropH, 0, 0, W, cropH);
-      bitmap.close();
+    removeVisibleWatermark(ctx, W, H);
 
-    } else {
-      // SMART / FILL / STRIP: full-image draw destroys SynthID watermark.
-      canvas.width  = W;
-      canvas.height = H;
-      ctx.drawImage(bitmap, 0, 0);
-      bitmap.close();
-
-      if (cfg.removeVisible && cfg.method !== 'strip') {
-        removeVisibleWatermark(ctx, W, H, cfg.method);
-      }
-    }
-
-    // v3.8: Robust SynthID removal — replaces the old "just re-encode" approach.
-    // Gaussian noise (σ=1.5) + JPEG round-trip disrupts both LSB and DCT-domain
-    // fingerprints. Applied to ALL methods including PNG output (previously PNG
-    // was completely ineffective since re-encode to lossless changes no pixels).
-    if (cfg.removeSynthID) {
-      const canvasH = canvas.height; // may be cropped for 'crop' method
-      await synthIdStrip(canvas, ctx, W, canvasH);
-    }
-
-    const mime = cfg.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-    const qual = cfg.format === 'jpeg' ? (cfg.jpegQuality ?? 0.96) : undefined;
+    // SynthID disruption: Gaussian noise (σ=1.5) + JPEG round-trip.
+    // Disrupts both LSB and DCT-domain fingerprints. Always applied.
+    await synthIdStrip(canvas, ctx, W, H);
 
     return new Promise((res, rej) =>
-      canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), mime, qual)
+      canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), 'image/png')
     );
   }
 
 
   // ── Visible Watermark Removal ──────────────────────────────────────────────
-  function removeVisibleWatermark(ctx, W, H, method) {
+  function removeVisibleWatermark(ctx, W, H) {
     const imgData  = ctx.getImageData(0, 0, W, H);
     const { data } = imgData;
 
     const region = detectSparkle(data, W, H);
     if (region) {
       log('Sparkle detected at', JSON.stringify(region));
-      inpaintRegion(data, W, H, region, method);
+      inpaintRegion(data, W, H, region);
       ctx.putImageData(imgData, 0, 0);
     } else {
       // Fallback: only apply if the corner actually contains sparkle-like pixels.
@@ -839,7 +889,7 @@
       if (cornerLooksLikeSparkle(data, W, H, sz)) {
         log('Sparkle not detected precisely — applying corner-zone fallback');
         const fallback = { x: W - sz, y: H - sz, width: sz, height: sz };
-        inpaintRegion(data, W, H, fallback, method);
+        inpaintRegion(data, W, H, fallback);
         ctx.putImageData(imgData, 0, 0);
       } else {
         log('No sparkle-like pixels in corner — skipping fallback to avoid artifact');
@@ -935,40 +985,19 @@
 
   // ── Inpainting ─────────────────────────────────────────────────────────────
   /**
-   * 'smart' (v3.3 IMPROVED):
-   *   Inverse-distance-weighted average of surrounding ring pixels, with
-   *   Gaussian noise scaled to the local pixel standard deviation. This
-   *   produces a far more natural fill than the old flat-average + fixed jitter.
+   * Smart inpainting: PatchMatch exemplar search (plain surfaces fall back to
+   * IDW background fill) plus a Gauss-Seidel boundary smoothing pass to
+   * eliminate the seam where the patched region meets the original pixels.
    *
-   * 'fill':
-   *   Copies pixels from directly above the watermark region (mirrored upward).
+   * This is the same core algorithm used by Photoshop Content-Aware Fill and
+   * professional inpainting tools — it finds the most visually similar patch
+   * from elsewhere in the image and copies that texture, making the result
+   * pixel-perfect on gradients and complex surfaces.
    */
-  function inpaintRegion(data, W, H, bounds, method) {
+  function inpaintRegion(data, W, H, bounds) {
     const { x, y, width: bw, height: bh } = bounds;
 
-    if (method === 'fill') {
-      for (let row = y; row < Math.min(H, y + bh); row++) {
-        const offset    = row - y;
-        const sourceRow = Math.max(0, y - offset - 1);
-        for (let col = x; col < Math.min(W, x + bw); col++) {
-          const src = (sourceRow * W + col) * 4;
-          const dst = (row       * W + col) * 4;
-          data[dst]     = data[src];
-          data[dst + 1] = data[src + 1];
-          data[dst + 2] = data[src + 2];
-          data[dst + 3] = 255;
-        }
-      }
-      return;
-    }
-
     // ── SMART: PatchMatch exemplar inpainting + soft boundary blending ────────
-    //
-    // This is the same core algorithm used by Photoshop Content-Aware Fill and
-    // professional AI inpainting tools. Instead of computing a smooth colour
-    // average (which loses texture), it finds the most visually similar patch
-    // from elsewhere in the image and copies that texture — making the result
-    // pixel-perfect even at full zoom on gradients and complex surfaces.
     //
     // Three phases:
     //   1. Build a per-pixel background estimate (IDW from border) + anomaly map
@@ -1268,30 +1297,39 @@
     return results.slice(0, 24);
   };
 
-  // ── v3.3 NEW: Batch download all found images ──────────────────────────────
+  // ── Batch download all found images ──────────────────────────────
   window.__UAI_downloadAll = async function () {
     const images = window.__UAI_scanImages();
     if (!images.length) return { ok: false, error: 'No images found on page' };
 
     let succeeded = 0;
     let failed = 0;
+    let cancelled = false;
     const errors = [];
 
-    // v4.0.7: single progress card that updates per image (Pro mode only)
+    // Single progress card that updates per image (Pro mode only). One
+    // AbortController governs the whole batch — cancelling aborts the
+    // in-flight image's inference AND skips the rest.
     const usePro = (cfg.method === 'ai');
-    const card = (usePro && cfg.showNotifications)
-      ? showProgressCard({ totalImages: images.length, currentIndex: 1 })
+    const abortCtrl = usePro ? new AbortController() : null;
+    const card = usePro
+      ? showProgressCard({
+          totalImages: images.length,
+          currentIndex: 1,
+          onCancel: abortCtrl ? () => { cancelled = true; abortCtrl.abort(); } : null,
+        })
       : null;
 
     for (let i = 0; i < images.length; i++) {
+      if (cancelled) break;
       const img = images[i];
       const filename = `unmark-ai-${i + 1}-of-${images.length}.png`;
       if (card) card.setBatch(i + 1, images.length);
       try {
         const rawBlob   = await fetchImage(img.src, blobCache.get(img.src));
-        const cleanBlob = await processImage(rawBlob);
+        const cleanBlob = await processImage(rawBlob, abortCtrl?.signal);
 
-        // v4.0.1: blob URL transport (was: dataUrl base64)
+        // blob URL transport (was: dataUrl base64)
         await downloadBlobViaBackground(cleanBlob, filename);
 
         await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
@@ -1300,6 +1338,7 @@
         await new Promise(r => setTimeout(r, 400));
         succeeded++;
       } catch (e) {
+        if (e.cancelled) { cancelled = true; break; }
         failed++;
         errors.push(e.message);
         log('downloadAll — image', i + 1, 'failed:', e.message);
@@ -1307,7 +1346,13 @@
     }
 
     if (card) {
-      if (succeeded === images.length) {
+      if (cancelled) {
+        card.cancelled(
+          succeeded > 0
+            ? `Stopped after ${succeeded} of ${images.length}`
+            : 'You cancelled the batch'
+        );
+      } else if (succeeded === images.length) {
         card.success(`${succeeded} of ${images.length} cleaned`);
       } else if (succeeded > 0) {
         card.success(`${succeeded} of ${images.length} cleaned · ${failed} failed`);
@@ -1316,36 +1361,69 @@
       }
     }
 
-    return { ok: succeeded > 0, succeeded, failed, total: images.length, errors };
+    return { ok: succeeded > 0, succeeded, failed, cancelled, total: images.length, errors };
   };
 
   window.__UAI_processAndDownload = async function (url, filename) {
-    // v4.0.7: progress card for Pro mode (popup grid Clean button + context menu)
+    // progress card for Pro mode (popup grid Clean button + context menu)
     const usePro = (cfg.method === 'ai');
-    const card = (usePro && cfg.showNotifications) ? showProgressCard() : null;
+    const abortCtrl = usePro ? new AbortController() : null;
+    const card = usePro
+      ? showProgressCard({ onCancel: abortCtrl ? () => abortCtrl.abort() : null })
+      : null;
     try {
       const rawBlob   = await fetchImage(url, blobCache.get(url), null);
-      const cleanBlob = await processImage(rawBlob);
+      const cleanBlob = await processImage(rawBlob, abortCtrl?.signal);
 
-      // v4.0.1: blob URL transport (was: dataUrl base64)
+      // blob URL transport (was: dataUrl base64)
       await downloadBlobViaBackground(cleanBlob, filename);
 
       await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
-      // v4.0.8: register original for "View original" link
+      // register original for "View original" link
       const originalId = registerOriginal(rawBlob, filename);
+      // and a downscaled cleaned preview for the Compare modal
+      cacheCleanedPreview(originalId, cleanBlob);
       if (card) card.success('Watermark removed · Saved', { originalId });
       return { ok: true, originalId };
     } catch (e) {
+      if (e.cancelled) {
+        log('processAndDownload cancelled by user');
+        if (card) card.cancelled('You cancelled this clean');
+        return { ok: false, cancelled: true };
+      }
       log('processAndDownload error:', e.message);
       if (card) card.error(e.message || 'Processing failed');
       return { ok: false, error: e.message };
     }
   };
 
-  // v4.0.8: callable from popup via chrome.scripting.executeScript so the
+  // callable from popup via chrome.scripting.executeScript so the
   // popup grid can offer "View original" too.
   window.__UAI_downloadOriginal = async function (id) {
     return downloadOriginal(id);
+  };
+
+  // Return downscaled before/after previews as JPEG data URLs so the popup
+  // can drive a comparison slider. Both images are downscaled to max 800px
+  // so the IPC payload stays well under typical sendMessage limits. Returns
+  // null if either side is missing (cache expired / different id / etc).
+  window.__UAI_getPreviewPair = async function (id) {
+    const orig  = originalsCache.get(id);
+    const clean = cleanedCache.get(id);
+    if (!orig || !clean) return null;
+    try {
+      // cleanedCache already holds a downscaled JPEG. Downscale original
+      // lazily; at full res a 4 MB PNG as a data URL is ~5.5 MB of IPC.
+      const origPreview = await downscaleToJpeg(orig.blob, 800, 0.88);
+      const [origUrl, cleanUrl] = await Promise.all([
+        blobToDataURL(origPreview),
+        blobToDataURL(clean.blob),
+      ]);
+      return { original: origUrl, cleaned: cleanUrl };
+    } catch (e) {
+      log('getPreviewPair failed:', e.message);
+      return null;
+    }
   };
 
   // Keep old names as aliases so background.js fallback still works if page not refreshed
@@ -1367,12 +1445,11 @@
 
   function normalizeFilename(name) {
     if (!name) return 'unmark-ai-clean.png';
-    const ext  = cfg.format === 'jpeg' ? '.jpg' : '.png';
     const base = name.replace(/\.(png|jpe?g|jpg|webp|gif|bmp|avif)$/i, '');
-    return base + ext;
+    return base + '.png';
   }
 
-  // ── Progress Card (v4.0.7) ─────────────────────────────────────────────────
+  // ── Progress Card ─────────────────────────────────────────────────
   //
   // Persistent in-page progress card for long Pro-mode operations. Lives inside
   // the Gemini tab itself (not the action popup), so it stays visible even when
@@ -1391,7 +1468,7 @@
 
   let activeProgressCard = null;
 
-  function showProgressCard({ totalImages = 1, currentIndex = 1 } = {}) {
+  function showProgressCard({ totalImages = 1, currentIndex = 1, onCancel = null } = {}) {
     // Replace any existing card (e.g. user triggered a second clean before
     // the first one's success animation finished)
     if (activeProgressCard) {
@@ -1488,6 +1565,47 @@
     tickFn();
     let tickInterval = setInterval(tickFn, 500);
 
+    // Optional Cancel button — appears only when the caller supplied an
+    // onCancel callback (i.e. they have an AbortController to trigger).
+    // Pointer-events are 'none' on the card root; we re-enable them for
+    // this button only so the card stays non-dismissable otherwise.
+    let cancelBtn = null;
+    if (typeof onCancel === 'function') {
+      cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      Object.assign(cancelBtn.style, {
+        display:        'block',
+        marginTop:      '10px',
+        padding:        '5px 10px',
+        background:     'rgba(239, 68, 68, 0.10)',
+        border:         '1px solid rgba(239, 68, 68, 0.25)',
+        borderRadius:   '6px',
+        color:          '#EF4444',
+        fontSize:       '11px',
+        fontWeight:     '500',
+        fontFamily:     'inherit',
+        cursor:         'pointer',
+        pointerEvents:  'auto',
+        transition:     'background 160ms ease',
+        letterSpacing:  '-.005em',
+      });
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('mouseenter', () => {
+        cancelBtn.style.background = 'rgba(239, 68, 68, 0.18)';
+      });
+      cancelBtn.addEventListener('mouseleave', () => {
+        cancelBtn.style.background = 'rgba(239, 68, 68, 0.10)';
+      });
+      cancelBtn.addEventListener('click', () => {
+        if (cancelBtn.disabled) return;
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = 'Cancelling…';
+        cancelBtn.style.opacity = '0.6';
+        try { onCancel(); } catch {}
+      });
+      card.appendChild(cancelBtn);
+    }
+
     function fadeAndRemove(delay = 0) {
       setTimeout(() => {
         card.style.opacity = '0';
@@ -1517,8 +1635,28 @@
         }
       },
 
+      // User-triggered abort reached a terminal state. Neutral amber theme
+      // (not error red) so the user doesn't think something broke.
+      cancelled(msg = 'Cancelled') {
+        clearInterval(tickInterval);
+        if (cancelBtn) cancelBtn.remove();
+        card.style.borderColor = 'rgba(245, 158, 11, 0.5)';
+        headEl.innerHTML = `
+          <div style="width:14px;height:14px;display:grid;place-items:center;
+                      background:#F59E0B;border-radius:50%;color:#fff;
+                      font-size:10px;font-weight:700;line-height:1;">↺</div>
+          <span style="font-size:10.5px;font-weight:600;letter-spacing:.04em;
+                       color:#F59E0B;text-transform:uppercase;">UnmarkAI · Cancelled</span>
+        `;
+        phaseEl.textContent = msg;
+        timerEl.textContent = '';
+        fadeAndRemove(2200);
+        if (activeProgressCard === controller) activeProgressCard = null;
+      },
+
       success(msg = 'Watermark removed', { originalId = null } = {}) {
         clearInterval(tickInterval);
+        if (cancelBtn) cancelBtn.remove();
         const sec = Math.floor((Date.now() - startTime) / 1000);
         card.style.borderColor = 'rgba(16, 185, 129, 0.5)';
         headEl.innerHTML = `
@@ -1532,7 +1670,7 @@
         phaseEl.textContent = msg;
         timerEl.textContent = `Completed in ${sec}s`;
 
-        // v4.0.8: optional "Download original" link if the caller cached the
+        // optional "Download original" link if the caller cached the
         // unprocessed image. Extends the card's lifetime so the user has time
         // to read + click. Pointer-events re-enabled on the link itself only.
         if (originalId) {
@@ -1586,6 +1724,7 @@
 
       error(msg = 'Something went wrong') {
         clearInterval(tickInterval);
+        if (cancelBtn) cancelBtn.remove();
         card.style.borderColor = 'rgba(239, 68, 68, 0.5)';
         headEl.innerHTML = `
           <div style="width:14px;height:14px;display:grid;place-items:center;
@@ -1609,8 +1748,6 @@
   let toastTimer = null;
 
   function toast(msg, type = 'info') {
-    if (!cfg.showNotifications) return;
-
     let el = document.getElementById('uai-toast');
     if (!el) {
       el = document.createElement('div');
@@ -1624,7 +1761,7 @@
         font:          '500 13px/1.4 "Google Sans",Roboto,sans-serif',
         zIndex:        '2147483647',
         pointerEvents: 'none',
-        transition:    'opacity .3s, transform .3s',
+        transition:    'opacity .3s, transform .3s, bottom .25s ease',
         boxShadow:     '0 4px 20px rgba(0,0,0,.35)',
         color:         '#fff',
         maxWidth:      '300px',
@@ -1632,6 +1769,16 @@
         transform:     'translateY(10px)',
       });
       document.body.appendChild(el);
+    }
+
+    // Stack above the progress card if one is showing, otherwise sit at 24px.
+    // Gives: [ toast ] ← 12px gap → [ card ] ← 24px → window bottom.
+    const card = document.getElementById('uai-progress-card');
+    if (card && document.body.contains(card)) {
+      const h = card.getBoundingClientRect().height;
+      el.style.bottom = `${24 + h + 12}px`;
+    } else {
+      el.style.bottom = '24px';
     }
 
     const COLORS = { info: '#6366F1', success: '#059669', error: '#DC2626' };

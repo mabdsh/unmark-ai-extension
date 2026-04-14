@@ -1,14 +1,13 @@
 /**
- * UnmarkAI v3.8 — MAIN WORLD Script
+ * UnmarkAI — MAIN WORLD Script
  *
- * CHANGES v3.7 → v3.8:
- *   NEW: autoIntercept flag.
- *     When false (Manual mode), ALL four intercept paths (prototype .click,
- *     dispatchEvent override, DOM click listener, MutationObserver) pass
- *     through without intercepting — native Gemini downloads proceed normally.
- *     The `enabled` flag still controls the master on/off; autoIntercept is
- *     an independent second gate checked ONLY when enabled=true.
- *     Received from content.js via GWR_SETTINGS message.
+ * AUTOINTERCEPT FLAG:
+ *   When autoIntercept is false (Manual mode), ALL four intercept paths
+ *   (prototype .click, dispatchEvent override, DOM click listener,
+ *   MutationObserver) pass through without intercepting — native Gemini
+ *   downloads proceed normally. The `enabled` flag still controls the master
+ *   on/off; autoIntercept is an independent second gate checked ONLY when
+ *   enabled=true. Received from content.js via GWR_SETTINGS message.
  *
  * WHY THIS FILE EXISTS:
  *   Chrome content scripts run in an "isolated world" — a sandboxed JS context.
@@ -37,7 +36,7 @@
 
   // Optimistic defaults — updated by isolated world via GWR_SETTINGS
   let enabled       = true;
-  let autoIntercept = true; // v3.8 — when false, all intercept paths pass through
+  let autoIntercept = true; // when false, all intercept paths pass through
 
   // ── Listen for control messages from isolated world ──────────────────────
   window.addEventListener('message', (e) => {
@@ -47,7 +46,7 @@
     switch (e.data.gwrType) {
       case 'GWR_SETTINGS':
         enabled       = !!e.data.enabled;
-        // v3.8: default true if key absent (backward compat with older content.js)
+        // default true if key absent (backward compat with older content.js)
         autoIntercept = e.data.autoIntercept !== false;
         break;
 
@@ -67,7 +66,7 @@
   const _origCreateObjURL = URL.createObjectURL.bind(URL);
 
   // ── Blob registry ────────────────────────────────────────────────────────
-  // v4.0.1: LRU cap (Map preserves insertion order) + 30s TTL (down from 90s)
+  // LRU cap (Map preserves insertion order) + 30s TTL (down from 90s)
   // bounds memory under heavy Gemini sessions (was holding 100+ MB).
   const blobMap = new Map();
   const BLOB_MAP_MAX = 8;
@@ -136,7 +135,7 @@
 
   // ── Real user click on download anchor ───────────────────────────────────
   document.addEventListener('click', function uaiCaptureClick(e) {
-    // v3.8: skip intercept when disabled OR in manual mode
+    // skip intercept when disabled OR in manual mode
     if (!enabled || !autoIntercept) return;
     const anchor = e.target.closest('a');
     if (!anchor || anchor._uaiDone) return;
@@ -152,7 +151,7 @@
 
   // ── Override: programmatic .click() on anchors ───────────────────────────
   HTMLAnchorElement.prototype.click = function () {
-    // v3.8: pass through if extension off OR in manual mode
+    // pass through if extension off OR in manual mode
     if (this._uaiDone || !enabled || !autoIntercept) return _origClick.apply(this, arguments);
     const href = this.href;
     if (!looksLikeGeminiImage(href)) return _origClick.apply(this, arguments);
@@ -162,7 +161,7 @@
 
   // ── Override: dispatchEvent (synthetic clicks) ───────────────────────────
   EventTarget.prototype.dispatchEvent = function (event) {
-    // v3.8: pass through if extension off OR in manual mode
+    // pass through if extension off OR in manual mode
     if (
       enabled && autoIntercept &&
       !this._uaiDone &&
@@ -179,7 +178,7 @@
 
   // ── MutationObserver: catch append-click-remove anchor pattern ───────────
   new MutationObserver((mutations) => {
-    // v3.8: skip observer work entirely in manual mode
+    // skip observer work entirely in manual mode
     if (!enabled || !autoIntercept) return;
     for (const m of mutations) {
       for (const node of m.addedNodes) {
@@ -310,5 +309,5 @@
     console.log('%c' + TAG, 'color:#2DD4BF;font-weight:700', ...args);
   }
 
-  log('MAIN world interceptors installed ✦ v4.0.4 | autoIntercept=', autoIntercept);
+  log('MAIN world interceptors installed | autoIntercept=', autoIntercept);
 })();

@@ -1,5 +1,5 @@
 /**
- * UnmarkAI v4.0.6 — Offscreen Document
+ * UnmarkAI — Offscreen Document
  *
  * WHY THIS FILE EXISTS:
  *   Chrome MV3 service workers do NOT have URL.createObjectURL, document, or
@@ -7,9 +7,9 @@
  *   and to load the WASM binary, so it crashes when run from a SW.
  *
  *   This Offscreen Document is a hidden DOM context the extension owns. It has
- *   full document APIs including URL.createObjectURL, WebGPU, and worker support.
- *   Background.js spawns it on demand and forwards inference requests via
- *   chrome.runtime.sendMessage.
+ *   full document APIs including URL.createObjectURL, WebGPU, and worker
+ *   support. Background.js spawns it on demand and forwards inference requests
+ *   via chrome.runtime.sendMessage.
  *
  * RESPONSIBILITIES:
  *   - Load ORT + LaMa model from CDN (or IndexedDB cache)
@@ -25,7 +25,7 @@ if (self.ort) {
   const extRoot = chrome.runtime.getURL('');
   self.ort.env.wasm.wasmPaths = extRoot;
   self.ort.env.wasm.simd      = true;
-  // v4.0.4: single-thread WASM. ORT loads `ort-wasm-simd.wasm` with this config,
+  // Single-thread WASM. ORT loads `ort-wasm-simd.wasm` with this config,
   // which is the only WASM binary bundled. To enable multi-thread (4× faster
   // inference), also add `ort-wasm-simd-threaded.wasm` (from the same ORT
   // npm version) to the extension root and bump this number.
@@ -94,6 +94,10 @@ async function idbDelete(key) {
 let modelLoadState = { status: 'idle', progress: 0, error: null };
 let lamaSession    = null;
 let loadingPromise = null;
+// Module-level so the 'cancelDownload' message handler can abort an
+// in-flight fetch. Reset to null after each download attempt finishes
+// (success, failure, or cancellation).
+let currentDownloadController = null;
 
 function setModelState(patch) {
   Object.assign(modelLoadState, patch);
@@ -113,16 +117,32 @@ async function downloadModelFromCDN() {
   console.log('[UAI offscreen] Downloading model from CDN:', MODEL_CDN_URL);
   setModelState({ status: 'downloading', progress: 0, error: null });
 
+  // AbortController — user can cancel from popup → bg → us.
+  currentDownloadController = new AbortController();
+  const { signal } = currentDownloadController;
+
   let response;
   try {
-    response = await fetch(MODEL_CDN_URL, { cache: 'no-store', redirect: 'follow' });
+    response = await fetch(MODEL_CDN_URL, {
+      cache:    'no-store',
+      redirect: 'follow',
+      signal,
+    });
   } catch (e) {
+    currentDownloadController = null;
+    if (e.name === 'AbortError') {
+      const err = new Error('Download cancelled');
+      err.cancelled = true;
+      throw err;
+    }
     throw new Error(`Network error reaching CDN: ${e.message}`);
   }
   if (!response.ok) {
+    currentDownloadController = null;
     throw new Error(`CDN responded HTTP ${response.status} ${response.statusText}`);
   }
   if (!response.body) {
+    currentDownloadController = null;
     throw new Error('CDN response has no body');
   }
 
@@ -132,24 +152,36 @@ async function downloadModelFromCDN() {
   let received = 0;
   let lastPct  = -1;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    if (contentLength > 0) {
-      const pct = Math.min(99, Math.round((received / contentLength) * 100));
-      if (pct !== lastPct) {
-        lastPct = pct;
-        setModelState({ status: 'downloading', progress: pct });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (contentLength > 0) {
+        const pct = Math.min(99, Math.round((received / contentLength) * 100));
+        if (pct !== lastPct) {
+          lastPct = pct;
+          setModelState({ status: 'downloading', progress: pct });
+        }
       }
     }
+  } catch (e) {
+    currentDownloadController = null;
+    if (e.name === 'AbortError' || signal.aborted) {
+      try { await reader.cancel(); } catch {}
+      const err = new Error('Download cancelled');
+      err.cancelled = true;
+      throw err;
+    }
+    throw e;
   }
 
   const full = new Uint8Array(received);
   let offset = 0;
   for (const chunk of chunks) { full.set(chunk, offset); offset += chunk.length; }
 
+  currentDownloadController = null;
   setModelState({ status: 'downloading', progress: 100 });
   console.log('[UAI offscreen] Download complete —', (received / 1024 / 1024).toFixed(1), 'MB');
   return full.buffer;
@@ -158,7 +190,7 @@ async function downloadModelFromCDN() {
 // ── Main model loader ────────────────────────────────────────────────────────
 async function getLamaSession() {
   if (lamaSession) {
-    // v4.0.6: re-broadcast state so a freshly-restarted background mirror
+    // Re-broadcast state so a freshly-restarted background mirror
     // catches up. Cheap (no real work happens here).
     setModelState({ status: 'ready', progress: 100, error: null });
     return lamaSession;
@@ -211,7 +243,7 @@ async function getLamaSession() {
       }
 
       // 3. Create ORT session — WASM only.
-      // v4.0.4: removed 'webgpu' from providers because the matching
+      // Removed 'webgpu' from providers because the matching
       // `ort-wasm-simd.jsep.wasm` binary is not bundled. To enable WebGPU
       // (significantly faster on modern GPUs), bundle that file and switch
       // the providers list to ['webgpu', 'wasm'].
@@ -228,9 +260,15 @@ async function getLamaSession() {
       console.log('[UAI offscreen] session ready ✓ inputs:', lamaSession.inputNames);
       return lamaSession;
     } catch (err) {
-      setModelState({ status: 'error', error: err.message });
       lamaSession    = null;
       loadingPromise = null;
+      if (err.cancelled) {
+        // User-initiated cancel — reset to idle so the popup can show the
+        // "ready to set up" panel again rather than a Retry button.
+        setModelState({ status: 'idle', progress: 0, error: null });
+      } else {
+        setModelState({ status: 'error', error: err.message });
+      }
       throw err;
     }
   })();
@@ -406,11 +444,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .catch(e => sendResponse({ ok: false, error: e.message }));
       return true;
     }
+    case 'cancelDownload': {
+      // Abort any in-flight CDN fetch. If no download is active this is a no-op.
+      if (currentDownloadController) {
+        try { currentDownloadController.abort(); } catch {}
+      }
+      sendResponse({ ok: true });
+      return false;
+    }
   }
   return false;
 });
 
-// v4.0.6: On boot, auto-load the model if it's cached in IDB.
+// On boot, auto-load the model if it's cached in IDB.
 //
 // WHY: Chrome periodically terminates idle offscreen documents. When it
 // respawns, the in-memory ORT session is gone but the model stays in IDB.
@@ -423,8 +469,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 (async () => {
   try {
     if (!self.ort) {
-      // ORT didn't load — probably a build issue. Stay idle, surface error on use.
-      setModelState({ status: 'idle', progress: 0, error: null });
+      // ORT didn't load — probably a build issue. Surface the error so the
+      // popup's Retry button appears instead of a misleading "not downloaded".
+      setModelState({
+        status: 'error',
+        progress: 0,
+        error: 'ONNX Runtime failed to load (ort.min.js)',
+      });
       return;
     }
     const cached = await idbGet(IDB_KEY);
@@ -452,9 +503,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       setModelState({ status: 'idle', progress: 0, error: null });
     }
   } catch (e) {
-    console.warn('[UAI offscreen] Auto-load failed, falling back to lazy load:', e.message);
+    // ORT session creation failed on a cached model. The cache is likely
+    // corrupt — drop it so the next warmup triggers a fresh download — and
+    // surface the error to the popup so the user sees what happened.
+    console.warn('[UAI offscreen] Auto-load failed, discarding cache:', e.message);
+    try { await idbDelete(IDB_KEY); } catch {}
     lamaSession = null;
-    setModelState({ status: 'idle', progress: 0, error: null });
+    setModelState({
+      status: 'error',
+      progress: 0,
+      error: 'Cached model failed to load (' + (e.message || 'unknown error') + '). Cache cleared — Retry to re-download.',
+    });
   }
 })();
 console.log('[UAI offscreen] Ready');

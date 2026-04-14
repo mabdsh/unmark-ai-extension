@@ -17,16 +17,29 @@
       </div>
       <div class="brand-text">
         <span class="brand-name">UnmarkAI</span>
-        <span class="brand-sub" id="statusLabel">Watermark remover</span>
+        <span class="brand-sub" id="statusLabel">Clean Gemini images</span>
       </div>
     </div>
-    <label class="switch" title="Enable extension">
-      <input type="checkbox" id="enabledCheckbox"/>
+    <label class="switch" title="Enable UnmarkAI">
+      <input type="checkbox" id="enabledCheckbox" role="switch" aria-label="Enable UnmarkAI"/>
       <span class="switch-rail"><span class="switch-thumb"></span></span>
     </label>
     <!-- statusDot kept for popup.js compat (off-screen, not visually used) -->
     <span class="sr-only" id="statusDot"></span>
   </header>
+
+  <!-- ── Onboarding (first-run only) ─────────────────────────────── -->
+  <section class="welcome" id="welcomeBanner" hidden>
+    <div class="welcome-icon" aria-hidden="true">✦</div>
+    <div class="welcome-text">
+      <div class="welcome-title">Welcome to UnmarkAI</div>
+      <div class="welcome-body">
+        Save any image from Gemini or AI Studio and UnmarkAI cleans the ✦ badge
+        automatically — all on your device.
+      </div>
+    </div>
+    <button class="welcome-dismiss" id="welcomeDismiss" type="button">Got it</button>
+  </section>
 
   <!-- ── Stats ────────────────────────────────────────────────────── -->
   <section class="stats">
@@ -36,7 +49,7 @@
     </div>
     <div class="stat">
       <span class="stat-num" id="statSession">0</span>
-      <span class="stat-label">Session</span>
+      <span class="stat-label">Today</span>
     </div>
   </section>
 
@@ -53,7 +66,7 @@
         </div>
         <div class="engine-meta">
           <span class="engine-name">Quick</span>
-          <span class="engine-desc">Algorithmic · Instant</span>
+          <span class="engine-desc">Instant · Best on flat backgrounds</span>
         </div>
       </button>
 
@@ -65,11 +78,44 @@
         </div>
         <div class="engine-meta">
           <span class="engine-name">Pro</span>
-          <span class="engine-desc">AI model · Best quality</span>
+          <span class="engine-desc">~30s · Best on photos &amp; textures</span>
         </div>
         <span class="engine-badge" id="pillAiBadge" hidden></span>
       </button>
 
+    </div>
+
+    <!-- Info toggle: helps users decide between engines before the Pro download -->
+    <button class="engine-info-toggle" id="engineInfoToggle" type="button"
+            aria-expanded="false" aria-controls="engineInfoPanel">
+      <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+        <circle cx="5" cy="5" r="4" fill="none" stroke="currentColor" stroke-width="1"/>
+        <path d="M5 4v3M5 2.5v.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+      </svg>
+      <span id="engineInfoLabel">Which should I pick?</span>
+    </button>
+
+    <div class="engine-info-panel" id="engineInfoPanel" hidden>
+      <div class="eip-col">
+        <div class="eip-col-title">Use Quick for</div>
+        <ul class="eip-list">
+          <li>Screenshots, diagrams, UI mockups</li>
+          <li>Flat or solid-color backgrounds</li>
+          <li>When you need the file saved now</li>
+        </ul>
+      </div>
+      <div class="eip-col">
+        <div class="eip-col-title">Use Pro for</div>
+        <ul class="eip-list">
+          <li>Photos, landscapes, complex textures</li>
+          <li>Large images where quality matters</li>
+          <li>Avoiding any edge artifacts</li>
+        </ul>
+      </div>
+      <div class="eip-note">
+        Both engines run entirely on your device. Pro needs a one-time 198 MB
+        download; after that it works offline.
+      </div>
     </div>
 
     <!-- Model status — shown only when Pro is active -->
@@ -82,11 +128,12 @@
   <section class="block">
     <div class="row">
       <div class="row-meta">
-        <span class="row-title">Auto-clean</span>
+        <span class="row-title" id="autoCleanTitle">Auto-clean</span>
         <span class="row-desc" id="autoCleanSub">Clean automatically when you save from Gemini</span>
       </div>
       <label class="switch switch-sm">
-        <input type="checkbox" id="autoCleanCheckbox"/>
+        <input type="checkbox" id="autoCleanCheckbox" role="switch"
+               aria-labelledby="autoCleanTitle" aria-describedby="autoCleanSub"/>
         <span class="switch-rail"><span class="switch-thumb"></span></span>
       </label>
     </div>
@@ -95,7 +142,7 @@
   <!-- ── Scan / images ────────────────────────────────────────────── -->
   <section class="block scan-block" id="scanSection">
     <div class="scan-head">
-      <span class="scan-status" id="scanHint">Scan a Gemini page for images</span>
+      <span class="scan-status" id="scanHint">Loading…</span>
       <div class="scan-actions">
         <button class="btn btn-ghost" id="dlAllBtn" hidden>Clean all</button>
         <button class="btn btn-primary" id="scanBtn">Scan</button>
@@ -111,14 +158,56 @@
     <div class="img-grid" id="imageGrid" hidden></div>
   </section>
 
+  <!-- ── Privacy note — earns user trust, reiterates that nothing uploads ── -->
+  <div class="privacy-note" role="note">
+    <svg class="privacy-icon" width="10" height="12" viewBox="0 0 10 12" aria-hidden="true">
+      <path d="M5 0L1 2v4c0 2.5 1.7 4.7 4 5.5 2.3-.8 4-3 4-5.5V2L5 0z"
+            fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+      <path d="M3.5 5.5L4.5 6.5L6.5 4.5" fill="none" stroke="currentColor"
+            stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    On-device processing · Images never leave your browser
+  </div>
+
   <!-- ── Footer ───────────────────────────────────────────────────── -->
   <footer class="footer">
     <button class="footer-link" id="resetBtn">Reset stats</button>
     <a class="footer-link" id="privacyLink"
        href="https://github.com/mabdsh/lama_fp32/blob/main/PRIVACY.md"
        target="_blank" rel="noopener">Privacy</a>
-    <span class="footer-version">v4.0.9</span>
+    <span class="footer-version">v1.0.0</span>
   </footer>
+
+  <!-- ── Before/After modal (hidden until a Compare button is clicked) ── -->
+  <div class="preview-modal" id="previewModal" hidden role="dialog"
+       aria-modal="true" aria-labelledby="previewModalTitle">
+    <div class="preview-backdrop" id="previewBackdrop"></div>
+    <div class="preview-sheet">
+      <div class="preview-head">
+        <span class="preview-title" id="previewModalTitle">Before / After</span>
+        <button class="preview-close" id="previewClose" type="button"
+                aria-label="Close comparison">✕</button>
+      </div>
+      <div class="preview-stage" id="previewStage">
+        <div class="preview-loading" id="previewLoading">Loading preview…</div>
+        <div class="preview-slider" id="previewSlider" hidden>
+          <img class="preview-img preview-cleaned" id="previewCleaned" alt="Cleaned" draggable="false">
+          <div class="preview-clip" id="previewClip">
+            <img class="preview-img preview-original" id="previewOriginal" alt="Original" draggable="false">
+          </div>
+          <div class="preview-divider" id="previewDivider" aria-hidden="true">
+            <div class="preview-handle">
+              <span class="preview-handle-arrow">‹</span>
+              <span class="preview-handle-arrow">›</span>
+            </div>
+          </div>
+          <span class="preview-badge preview-badge-orig">Original</span>
+          <span class="preview-badge preview-badge-clean">Cleaned</span>
+        </div>
+      </div>
+      <div class="preview-hint">Drag the handle to compare</div>
+    </div>
+  </div>
 
   <script src="popup.js"></script>
 </body>

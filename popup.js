@@ -1,8 +1,8 @@
 /**
- * UnmarkAI v4.0.6 — Popup Script (Production)
+ * UnmarkAI — Popup Script
  *
  * Model states: idle → downloading (0–100%) → loading → ready | error
- * Auto-clean: cfg.autoIntercept — toggle exposed to user
+ * Auto-clean:   cfg.autoIntercept — toggle exposed to user
  * Live updates: Port('uai-popup') pushes model state in real time
  */
 'use strict';
@@ -31,24 +31,35 @@ const pillAiBadge    = $('pillAiBadge');
 const methodPills    = document.querySelectorAll('.method-pill');
 
 // ── Config ─────────────────────────────────────────────────────────────────
+// Only three user-controllable settings. Output format is always PNG; visible
+// watermark + SynthID removal + notifications are always on — see content.js.
 let cfg = {
-  enabled:           true,
-  autoIntercept:     true,
-  removeVisible:     true,
-  removeSynthID:     true,
-  method:            'smart',
-  format:            'png',
-  jpegQuality:       0.96,
-  showNotifications: true,
+  enabled:       true,
+  autoIntercept: true,
+  method:        'smart',
 };
 
-// v4.0.1: hold session count in state (was parsed from DOM textContent — fragile)
-let sessionCountUI = 0;
+// Popup-local view of today's cleaned count (persisted in chrome.storage.local
+// by background.js — "Today" resets on a date change, not on SW restart).
+let todayCountUI = 0;
+
+// ── "Today" stat helpers ───────────────────────────────────────────────────
+function todayKey() {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
 
 // ── Model state ────────────────────────────────────────────────────────────
 let modelState = { status: 'unknown', progress: 0, error: null };
 let bgPort     = null;
 let bgPortRetries = 0;
+
+// Backoff between reconnect attempts: 1s, 2s, 4s, 8s, 16s (cap at 30s).
+function reconnectDelay() {
+  return Math.min(30_000, 1000 * Math.pow(2, bgPortRetries));
+}
 
 function connectBgPort() {
   try {
@@ -68,14 +79,16 @@ function connectBgPort() {
     });
     bgPort.onDisconnect.addListener(() => {
       bgPort = null;
-      // Auto-reconnect with exponential backoff (max 5 retries)
-      if (bgPortRetries++ < 5) {
-        setTimeout(connectBgPort, 1000 * bgPortRetries);
+      // Auto-reconnect with true exponential backoff (max 5 retries)
+      if (bgPortRetries < 5) {
+        setTimeout(connectBgPort, reconnectDelay());
+        bgPortRetries++;
       }
     });
   } catch {
-    if (bgPortRetries++ < 5) {
-      setTimeout(connectBgPort, 1000 * bgPortRetries);
+    if (bgPortRetries < 5) {
+      setTimeout(connectBgPort, reconnectDelay());
+      bgPortRetries++;
     }
   }
 }
@@ -84,30 +97,45 @@ function connectBgPort() {
 async function boot() {
   connectBgPort();
 
-  const [stored, statsData, sessionData] = await Promise.all([
+  const [stored, statsData, dailyData, welcomeData] = await Promise.all([
     chrome.storage.sync.get('settings'),
     chrome.storage.sync.get('stats'),
-    chrome.runtime.sendMessage({ action: 'getSession' }).catch(() => ({ sessionCount: 0 })),
+    chrome.storage.local.get('dailyStats'),
+    chrome.storage.local.get('welcomeDismissed'),
   ]);
 
   if (stored.settings) Object.assign(cfg, stored.settings);
 
-  // Force optimal hidden settings
-  cfg.removeVisible     = true;
-  cfg.removeSynthID     = true;
-  cfg.showNotifications = true;
-  cfg.format            = 'png';
+  // "Today" count: honour the date in storage. A stale (previous-day) record
+  // renders as 0 until background.js increments for today.
+  const today = todayKey();
+  const todayCount = (dailyData.dailyStats && dailyData.dailyStats.date === today)
+    ? dailyData.dailyStats.count
+    : 0;
 
   renderCfg();
-  renderStats(statsData.stats, sessionData?.sessionCount ?? 0);
+  renderStats(statsData.stats, todayCount);
 
-  // Auto-scan on Gemini pages
+  // Onboarding: show only on truly cold start (no cleans ever) AND not
+  // already dismissed. Either of those being true hides it forever.
+  const totalEver = statsData.stats?.totalRemoved ?? 0;
+  renderWelcome(totalEver === 0 && !welcomeData.welcomeDismissed);
+
+  // Scan hint defaults before any scan runs. If we're on Gemini, a scan will
+  // auto-fire in 200ms and overwrite this anyway — but setting it inline
+  // avoids the "Loading…" flash for the fraction of a second in between.
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url?.includes('gemini.google.com') || tab?.url?.includes('aistudio.google.com')) {
+    const onGemini = tab?.url?.includes('gemini.google.com') || tab?.url?.includes('aistudio.google.com');
+    if (onGemini) {
+      scanHint.textContent = 'Scan for images on this page';
       setTimeout(scanPageImages, 200);
+    } else {
+      scanHint.textContent = 'Open Gemini or AI Studio to scan';
     }
-  } catch {}
+  } catch {
+    scanHint.textContent = 'Open Gemini or AI Studio to scan';
+  }
 }
 
 function renderCfg() {
@@ -130,15 +158,45 @@ function renderCfg() {
   }
 }
 
-function renderStats(stats, session) {
-  sessionCountUI = session ?? 0;
+function renderStats(stats, todayCount) {
+  todayCountUI = todayCount ?? 0;
   statTotal.textContent   = (stats?.totalRemoved ?? 0).toLocaleString();
-  statSession.textContent = sessionCountUI.toLocaleString();
+  statSession.textContent = todayCountUI.toLocaleString();
 }
+
+// ── Onboarding ─────────────────────────────────────────────────────────────
+const welcomeBanner  = $('welcomeBanner');
+const welcomeDismiss = $('welcomeDismiss');
+
+function renderWelcome(show) {
+  welcomeBanner.hidden = !show;
+}
+
+welcomeDismiss?.addEventListener('click', async () => {
+  renderWelcome(false);
+  try {
+    await chrome.storage.local.set({ welcomeDismissed: true });
+  } catch {}
+});
+
+// ── Engine info expander ───────────────────────────────────────────────────
+const engineInfoToggle = $('engineInfoToggle');
+const engineInfoPanel  = $('engineInfoPanel');
+const engineInfoLabel  = $('engineInfoLabel');
+
+engineInfoToggle?.addEventListener('click', () => {
+  const expanded = engineInfoToggle.getAttribute('aria-expanded') === 'true';
+  const next = !expanded;
+  engineInfoToggle.setAttribute('aria-expanded', String(next));
+  engineInfoPanel.hidden = !next;
+  engineInfoLabel.textContent = next ? 'Hide comparison' : 'Which should I pick?';
+});
 
 function setStatus(on) {
   statusDot.classList.toggle('off', !on);
-  statusLabel.textContent = on ? 'Watermark remover' : 'Paused';
+  // When on, the subtitle acts as an action-oriented tagline.
+  // When off, it reads as hard status.
+  statusLabel.textContent = on ? 'Clean Gemini images' : 'Off';
 }
 
 function updateAutoCleanSub() {
@@ -179,21 +237,31 @@ function renderModelStatus() {
       <div class="ms-body">
         <div class="ms-spinner"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title">Downloading model · ${pct}%</span>
-          <span class="ms-sub">First-time setup · ~198 MB · Saved permanently</span>
+          <span class="ms-title">Setting up Pro mode · ${pct}%</span>
+          <span class="ms-sub">One-time download · ~198 MB · Works offline after</span>
         </div>
+        <button class="ms-retry ms-cancel" id="msCancelBtn" type="button">Cancel</button>
       </div>
       <div class="ms-progress">
         <div class="ms-progress-fill" style="width:${pct}%"></div>
       </div>`;
+    setTimeout(() => {
+      $('msCancelBtn')?.addEventListener('click', async () => {
+        const btn = $('msCancelBtn');
+        if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+        try {
+          await chrome.runtime.sendMessage({ action: 'cancelModelDownload' });
+        } catch {}
+      });
+    }, 30);
 
   } else if (status === 'loading') {
     modelStatusInner.innerHTML = `
       <div class="ms-body">
         <div class="ms-spinner"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title">Initializing engine</span>
-          <span class="ms-sub">Almost ready</span>
+          <span class="ms-title">Preparing the engine</span>
+          <span class="ms-sub">A few seconds and we're ready</span>
         </div>
       </div>
       <div class="ms-progress">
@@ -206,24 +274,65 @@ function renderModelStatus() {
       <div class="ms-body">
         <div class="ms-dot green"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title ready">Pro engine ready</span>
-          <span class="ms-sub">Neural inpainting active</span>
+          <span class="ms-title ready">Pro mode ready</span>
+          <span class="ms-sub">Running on your device · No uploads</span>
         </div>
       </div>`;
 
   } else if (status === 'error') {
     ms.classList.add('ms-state-error');
-    const errMsg = (error || 'Unknown error').toString();
-    const errShort = errMsg.length > 90 ? errMsg.slice(0, 87) + '…' : errMsg;
-    modelStatusInner.innerHTML = `
-      <div class="ms-body">
-        <div class="ms-dot red"></div>
-        <div class="ms-text-wrap">
-          <span class="ms-title">Model download failed</span>
-          <span class="ms-sub" title="${errMsg.replace(/"/g, '&quot;')}">${errShort}</span>
-        </div>
-        <button class="ms-retry" id="msRetryBtn">Retry</button>
-      </div>`;
+    const errMsg     = (error || 'Unknown error').toString();
+    const isLongMsg  = errMsg.length > 90;
+    const errShort   = isLongMsg ? errMsg.slice(0, 87) + '…' : errMsg;
+
+    // Build with DOM APIs so the error message cannot break out via <, >, &, ".
+    modelStatusInner.textContent = '';
+    const body = document.createElement('div');
+    body.className = 'ms-body';
+
+    const dot = document.createElement('div');
+    dot.className = 'ms-dot red';
+
+    const textWrap = document.createElement('div');
+    textWrap.className = 'ms-text-wrap';
+
+    const title = document.createElement('span');
+    title.className = 'ms-title';
+    title.textContent = "Couldn't set up Pro mode";
+
+    const sub = document.createElement('span');
+    sub.className = 'ms-sub';
+    sub.textContent = errShort;
+
+    textWrap.append(title, sub);
+
+    // Inline disclosure: only when the full message was truncated. Clicking
+    // expands the full error below the short one; we avoid title= tooltips
+    // because a 340px popup pinned to the toolbar clips them awkwardly.
+    if (isLongMsg) {
+      const details = document.createElement('button');
+      details.type = 'button';
+      details.className = 'ms-details-btn';
+      details.textContent = 'Show details';
+      details.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        details.remove();
+        const full = document.createElement('pre');
+        full.className = 'ms-details-full';
+        full.textContent = errMsg;
+        textWrap.appendChild(full);
+      });
+      textWrap.appendChild(details);
+    }
+
+    const retry = document.createElement('button');
+    retry.className = 'ms-retry';
+    retry.id = 'msRetryBtn';
+    retry.textContent = 'Retry';
+
+    body.append(dot, textWrap, retry);
+    modelStatusInner.appendChild(body);
     setTimeout(() => {
       $('msRetryBtn')?.addEventListener('click', async () => {
         await chrome.runtime.sendMessage({ action: 'clearModelCache' }).catch(() => {});
@@ -239,8 +348,8 @@ function renderModelStatus() {
       <div class="ms-body">
         <div class="ms-dot amber"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title">Model not downloaded</span>
-          <span class="ms-sub">Will download once · ~198 MB</span>
+          <span class="ms-title">Pro mode — ready to set up</span>
+          <span class="ms-sub">One-time 198 MB download · Runs fully on-device</span>
         </div>
       </div>`;
   }
@@ -258,13 +367,13 @@ function updateDownloadNotice() {
 
   if (status === 'downloading') {
     dlNoticeBar.innerHTML = `<div class="dl-notice-fill" style="width:${pct}%"></div>`;
-    dlNoticeText.textContent = `Downloading model · ${pct}% · Cleans will start once ready`;
+    dlNoticeText.textContent = `Setting up Pro mode · ${pct}% · Cleans start when ready`;
   } else if (status === 'loading') {
     dlNoticeBar.innerHTML = `<div class="dl-notice-fill indeterminate" style="width:40%"></div>`;
-    dlNoticeText.textContent = 'Initializing engine · Almost ready';
+    dlNoticeText.textContent = 'Preparing the engine · Almost ready';
   } else if (status === 'error') {
     dlNoticeBar.innerHTML = '';
-    dlNoticeText.textContent = 'Pro engine unavailable · Quick will be used instead';
+    dlNoticeText.textContent = 'Pro mode unavailable · Falling back to Quick';
   }
 }
 
@@ -283,10 +392,22 @@ function updatePillBadge() {
 }
 
 function refreshGridButtons() {
-  document.querySelectorAll('.img-clean-btn.state-loading').forEach(btn => {
-    btn.textContent = 'Clean';
-    btn.classList.remove('state-loading');
-    btn.disabled = false;
+  // When the model becomes ready, reset:
+  //   - loading-state buttons (still waiting for the model)
+  //   - retry-state buttons (previous attempt failed, but the user may want to
+  //     try again now that the model is up)
+  // We DON'T reset Done buttons — those represent completed cleans.
+  document.querySelectorAll('.img-clean-btn').forEach(btn => {
+    if (btn.classList.contains('state-loading')) {
+      btn.textContent = 'Clean';
+      btn.classList.remove('state-loading');
+      btn.disabled = false;
+      return;
+    }
+    if (btn.textContent === 'Retry') {
+      btn.textContent = 'Clean';
+      btn.disabled = false;
+    }
   });
 }
 
@@ -296,9 +417,11 @@ function isModelReady() { return modelState.status === 'ready'; }
 enabledCb.addEventListener('change', () => {
   cfg.enabled = enabledCb.checked;
   document.body.classList.toggle('paused', !cfg.enabled);
-  setStatus(cfg.enabled); save();
-  chrome.runtime.sendMessage({ action: 'toggleEnabled', enabled: cfg.enabled }).catch(() => {});
-  popupToast(cfg.enabled ? 'Enabled' : 'Paused', cfg.enabled ? 'success' : 'warning');
+  setStatus(cfg.enabled);
+  // Single storage write — background.js listens via storage.onChanged and
+  // updates its cachedSettings + badge from there. No second RPC needed.
+  save();
+  popupToast(cfg.enabled ? 'UnmarkAI enabled' : 'UnmarkAI turned off', cfg.enabled ? 'success' : 'warning');
 });
 
 autoCleanCb.addEventListener('change', () => {
@@ -306,7 +429,6 @@ autoCleanCb.addEventListener('change', () => {
   document.body.classList.toggle('manual-mode', !cfg.autoIntercept);
   updateAutoCleanSub();
   save();
-  chrome.runtime.sendMessage({ action: 'setAutoIntercept', autoIntercept: cfg.autoIntercept }).catch(() => {});
   popupToast(
     cfg.autoIntercept ? 'Auto-clean on' : 'Auto-clean off',
     cfg.autoIntercept ? 'success' : 'warning'
@@ -325,25 +447,85 @@ methodPills.forEach(pill => pill.addEventListener('click', () => {
     dlNotice.hidden    = true;
     pillAiBadge.hidden = true;
   }
+
+  // Re-render the Clean-all button label — the Pro estimate only shows
+  // when we know how many images are staged AND Pro is active.
+  if (dlAllBtn && !dlAllBtn.hidden) {
+    const n = Number(String(dlAllBtn.textContent).match(/\((\d+)\)/)?.[1] || 0);
+    if (n > 1) {
+      dlAllBtn.textContent = cfg.method === 'ai'
+        ? `Clean all (${n}) · ${batchEstimate(n)}`
+        : `Clean all (${n})`;
+    }
+  }
+
   save();
   popupToast(cfg.method === 'ai' ? 'Pro engine selected' : 'Quick engine selected', 'success');
 }));
 
+// ── Reset stats (two-step click) ─────────────────────────────────────────
+// First click arms the action for 3s (button turns amber, shows a shrinking
+// bar); a second click within that window commits. Prevents one-tap wipes.
+let resetArmed = false;
+let resetTimer = null;
+
+function disarmReset() {
+  resetArmed = false;
+  if (resetTimer) { clearTimeout(resetTimer); resetTimer = null; }
+  resetBtn.textContent = 'Reset stats';
+  resetBtn.classList.remove('confirming');
+}
+
 resetBtn.addEventListener('click', async () => {
-  await chrome.storage.sync.set({ stats: { totalRemoved: 0, lastReset: Date.now() } });
-  statTotal.textContent = '0'; bump(statTotal);
+  if (!resetArmed) {
+    resetArmed = true;
+    resetBtn.textContent = 'Click again to confirm';
+    resetBtn.classList.add('confirming');
+    resetTimer = setTimeout(disarmReset, 3000);
+    return;
+  }
+
+  // Confirmed — clear both counters so the zero UI matches the button's promise.
+  disarmReset();
+  await Promise.all([
+    chrome.storage.sync.set({ stats: { totalRemoved: 0, lastReset: Date.now() } }),
+    chrome.storage.local.set({ dailyStats: { date: todayKey(), count: 0 } }),
+  ]);
+  todayCountUI = 0;
+  statTotal.textContent   = '0'; bump(statTotal);
+  statSession.textContent = '0'; bump(statSession);
   popupToast('Stats reset', 'success');
 });
 
-chrome.storage.onChanged.addListener(changes => {
-  if (changes.stats?.newValue) {
-    statTotal.textContent = (changes.stats.newValue.totalRemoved ?? 0).toLocaleString();
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'sync' && changes.stats?.newValue) {
+    const total = changes.stats.newValue.totalRemoved ?? 0;
+    statTotal.textContent = total.toLocaleString();
     bump(statTotal);
+    // First ever clean → hide the onboarding if it's still up
+    if (total > 0) renderWelcome(false);
+  }
+  if (area === 'local' && changes.dailyStats?.newValue) {
+    const next = changes.dailyStats.newValue;
+    // Only render if the record is for today (guards against midnight edge cases)
+    if (next.date === todayKey()) {
+      todayCountUI = next.count ?? 0;
+      statSession.textContent = todayCountUI.toLocaleString();
+      bump(statSession);
+    }
   }
 });
 
 // ── Scan ───────────────────────────────────────────────────────────────────
 scanBtn.addEventListener('click', scanPageImages);
+
+// Estimated total wall time for a batch. Pro inference is ~35s per image
+// under single-thread WASM; Quick is near-instant so we only annotate Pro.
+function batchEstimate(n) {
+  const secs = n * 35;
+  const mins = Math.max(1, Math.round(secs / 60));
+  return `~${mins} min`;
+}
 
 async function scanPageImages() {
   scanBtn.disabled = true; scanBtn.textContent = '…';
@@ -378,7 +560,9 @@ async function scanPageImages() {
 
     if (dlAllBtn && images.length > 1) {
       dlAllBtn.hidden = false;
-      dlAllBtn.textContent = `Clean all (${images.length})`;
+      dlAllBtn.textContent = cfg.method === 'ai'
+        ? `Clean all (${images.length}) · ${batchEstimate(images.length)}`
+        : `Clean all (${images.length})`;
       dlAllBtn.disabled = false; dlAllBtn._tabId = tab.id;
     }
 
@@ -409,7 +593,7 @@ if (dlAllBtn) {
     const tabId = dlAllBtn._tabId;
     if (!tabId) { dlAllBtn.textContent = 'Error'; return; }
 
-    // v4.0.6: live elapsed counter so user knows the batch is alive.
+    // Live elapsed counter so the user knows the batch is alive.
     // Multi-image AI cleans can take several minutes total.
     const baseLabel = cfg.method === 'ai' ? 'Cleaning' : 'Cleaning';
     dlAllBtn.textContent = `${baseLabel}…`;
@@ -429,8 +613,8 @@ if (dlAllBtn) {
       const r = results?.[0]?.result;
       if (r?.ok) {
         dlAllBtn.textContent = `${r.succeeded} done`;
-        sessionCountUI += r.succeeded;
-        statSession.textContent = sessionCountUI.toLocaleString(); bump(statSession);
+        todayCountUI += r.succeeded;
+        statSession.textContent = todayCountUI.toLocaleString(); bump(statSession);
         popupToast(`${r.succeeded} image${r.succeeded !== 1 ? 's' : ''} cleaned`, 'success');
       } else {
         dlAllBtn.textContent = 'Retry'; dlAllBtn.disabled = false;
@@ -498,7 +682,7 @@ function renderImageGrid(images, tabId) {
         <div class="processing-timer" data-timer></div>`;
       card.appendChild(proc);
 
-      // v4.0.6: phase-aware progress overlay. Pro mode takes 30-40s; a static
+      // Phase-aware progress overlay. Pro mode takes 30-40s; a static
       // label looks frozen. Cycle through honest phase labels based on
       // elapsed time, with a small monospace seconds counter underneath.
       const phaseEl = proc.querySelector('[data-phase]');
@@ -551,10 +735,10 @@ function renderImageGrid(images, tabId) {
           btn.style.background = 'rgba(16,185,129,0.15)';
           btn.style.color = 'var(--green)';
           btn.style.borderColor = 'rgba(16,185,129,0.3)';
-          sessionCountUI += 1;
-          statSession.textContent = sessionCountUI.toLocaleString(); bump(statSession);
+          todayCountUI += 1;
+          statSession.textContent = todayCountUI.toLocaleString(); bump(statSession);
 
-          // v4.0.8: "View original" link below the Done button
+          // "View original" link below the Done button
           if (result.originalId) {
             const originalLink = document.createElement('button');
             originalLink.className = 'img-original-link';
@@ -583,6 +767,17 @@ function renderImageGrid(images, tabId) {
               }
             });
             overlay.appendChild(originalLink);
+
+            // "Compare" — opens the before/after modal.
+            const compareLink = document.createElement('button');
+            compareLink.className = 'img-compare-link';
+            compareLink.textContent = 'Compare';
+            compareLink.title = 'Show before/after comparison';
+            compareLink.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              openPreviewModal(tabId, result.originalId, compareLink);
+            });
+            overlay.appendChild(compareLink);
           }
         } else {
           btn.textContent = 'Retry'; btn.disabled = false;
@@ -622,5 +817,115 @@ function bump(el) {
   el.classList.remove('bump'); void el.offsetWidth;
   el.classList.add('bump'); setTimeout(() => el.classList.remove('bump'), 300);
 }
+
+// ── Before/After modal ─────────────────────────────────────────────────────
+// Single modal instance, reused. We fetch the pair lazily each time a card's
+// Compare button is clicked (pairs expire after 5 min per content.js TTL).
+
+const previewModal     = $('previewModal');
+const previewBackdrop  = $('previewBackdrop');
+const previewClose     = $('previewClose');
+const previewStage     = $('previewStage');
+const previewLoading   = $('previewLoading');
+const previewSlider    = $('previewSlider');
+const previewClip      = $('previewClip');
+const previewDivider   = $('previewDivider');
+const previewOriginal  = $('previewOriginal');
+const previewCleaned   = $('previewCleaned');
+
+function closePreviewModal() {
+  previewModal.hidden = true;
+  // Clear the sources so we don't keep ~1 MB of data URLs in the DOM between opens
+  previewOriginal.src = '';
+  previewCleaned.src  = '';
+  document.removeEventListener('keydown', onPreviewKey);
+}
+
+function onPreviewKey(e) {
+  if (e.key === 'Escape') closePreviewModal();
+}
+
+previewClose?.addEventListener('click', closePreviewModal);
+previewBackdrop?.addEventListener('click', closePreviewModal);
+
+async function openPreviewModal(tabId, originalId, triggerBtn) {
+  if (!tabId || !originalId) return;
+
+  // Reset + show the modal in loading state
+  previewSlider.hidden = true;
+  previewLoading.hidden = false;
+  previewLoading.textContent = 'Loading preview…';
+  previewSlider.style.setProperty('--split', '50%');
+  previewModal.hidden = false;
+  document.addEventListener('keydown', onPreviewKey);
+
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = 'Loading…';
+  }
+
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (id) => (window.__UAI_getPreviewPair?.(id) ?? null),
+      args: [originalId],
+    });
+    const pair = res?.[0]?.result;
+    if (!pair || !pair.original || !pair.cleaned) {
+      previewLoading.textContent = 'Preview no longer available';
+      setTimeout(closePreviewModal, 1600);
+      return;
+    }
+
+    previewOriginal.src = pair.original;
+    previewCleaned.src  = pair.cleaned;
+    // Wait for both images to actually render before swapping out the loader
+    await Promise.all([
+      previewOriginal.decode().catch(() => {}),
+      previewCleaned.decode().catch(() => {}),
+    ]);
+
+    previewLoading.hidden = true;
+    previewSlider.hidden  = false;
+  } catch (err) {
+    previewLoading.textContent = 'Could not load preview';
+    setTimeout(closePreviewModal, 1600);
+  } finally {
+    if (triggerBtn) {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = 'Compare';
+    }
+  }
+}
+
+// Drag logic: a single pointer listener on the slider updates the --split
+// CSS variable, which both the clip-path inset and the divider's left offset
+// read from. We use pointer events so mouse and touch both work.
+let previewDragging = false;
+
+function setSplitFromClientX(clientX) {
+  const rect = previewSlider.getBoundingClientRect();
+  const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+  const pct = (x / rect.width) * 100;
+  previewSlider.style.setProperty('--split', pct + '%');
+}
+
+previewSlider?.addEventListener('pointerdown', (e) => {
+  previewDragging = true;
+  previewSlider.setPointerCapture?.(e.pointerId);
+  setSplitFromClientX(e.clientX);
+  e.preventDefault();
+});
+previewSlider?.addEventListener('pointermove', (e) => {
+  if (!previewDragging) return;
+  setSplitFromClientX(e.clientX);
+});
+['pointerup', 'pointercancel', 'pointerleave'].forEach(evt =>
+  previewSlider?.addEventListener(evt, (e) => {
+    if (!previewDragging) return;
+    previewDragging = false;
+    try { previewSlider.releasePointerCapture?.(e.pointerId); } catch {}
+  })
+);
 
 boot();
