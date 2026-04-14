@@ -67,13 +67,21 @@
   const _origCreateObjURL = URL.createObjectURL.bind(URL);
 
   // ── Blob registry ────────────────────────────────────────────────────────
+  // v4.0.1: LRU cap (Map preserves insertion order) + 30s TTL (down from 90s)
+  // bounds memory under heavy Gemini sessions (was holding 100+ MB).
   const blobMap = new Map();
+  const BLOB_MAP_MAX = 8;
 
   URL.createObjectURL = function (obj) {
     const url = _origCreateObjURL(obj);
     if (obj instanceof Blob && obj.type && obj.type.startsWith('image/')) {
       blobMap.set(url, obj);
-      setTimeout(() => blobMap.delete(url), 90_000);
+      // Evict oldest if we're over the cap
+      while (blobMap.size > BLOB_MAP_MAX) {
+        const oldest = blobMap.keys().next().value;
+        blobMap.delete(oldest);
+      }
+      setTimeout(() => blobMap.delete(url), 30_000);
     }
     return url;
   };
@@ -302,5 +310,5 @@
     console.log('%c' + TAG, 'color:#2DD4BF;font-weight:700', ...args);
   }
 
-  log('MAIN world interceptors installed ✦ v3.8 | autoIntercept=', autoIntercept);
+  log('MAIN world interceptors installed ✦ v4.0.4 | autoIntercept=', autoIntercept);
 })();

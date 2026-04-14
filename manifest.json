@@ -1,22 +1,20 @@
 {
   "manifest_version": 3,
   "name": "UnmarkAI",
-  "version": "4.0.0",
-  "description": "Removes watermarks from Gemini & AI Studio images. AI (LaMa) + Smart methods. WebGL-accelerated inference. Destroys SynthID fingerprint.",
+  "version": "1.0.0",
+  "description": "Removes watermarks from Gemini & AI Studio images. AI + Smart methods. Disrupts SynthID fingerprint via noise + DCT round-trip.",
   "permissions": [
     "storage",
     "scripting",
     "contextMenus",
     "downloads",
     "tabs",
-    "alarms"
+    "offscreen"
   ],
   "host_permissions": [
     "https://gemini.google.com/*",
     "https://aistudio.google.com/*",
-    "https://*.googleapis.com/*",
     "https://*.googleusercontent.com/*",
-    "https://storage.googleapis.com/*",
     "https://github.com/*",
     "https://objects.githubusercontent.com/*",
     "https://release-assets.githubusercontent.com/*"
@@ -66,5 +64,14 @@
     "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+U"
+      },
+      "description": "Open UnmarkAI popup"
+    }
+  },
+  "web_accessible_resources": []
 }

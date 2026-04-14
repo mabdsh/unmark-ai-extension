@@ -1,5 +1,5 @@
 /**
- * UnmarkAI v3.3 — ISOLATED WORLD Content Script
+ * UnmarkAI v4.0.9 — ISOLATED WORLD Content Script
  *
  * Has access to Chrome APIs but cannot intercept page JS (that's main-world.js).
  * Communicates with main-world.js via window.postMessage.
@@ -67,9 +67,55 @@
 
     syncSettings();
     installMessageBridge();
+    installSpaNavigationCleanup();  // v4.0.1 — clear stale image hints on Gemini SPA nav
     preWarmLaMa();  // trigger model load immediately if AI method is already set
     log('ISOLATED world ready on', window.location.hostname);
   })();
+
+  // v4.0.1 — Gemini is a SPA. Stale uaiClickedSrc/uaiHoveredSrc dataset values
+  // can persist across chats and cause the next download to grab a wrong image.
+  // Hook history.pushState/replaceState/popstate to clear them on every nav.
+  function installSpaNavigationCleanup() {
+    function clearImageHints() {
+      delete document.documentElement.dataset.uaiClickedSrc;
+      delete document.documentElement.dataset.uaiClickedTime;
+      delete document.documentElement.dataset.uaiHoveredSrc;
+      delete document.documentElement.dataset.uaiHoveredTime;
+      hoveredSrc = null;
+      hoveredTime = 0;
+    }
+    const _push = history.pushState;
+    const _replace = history.replaceState;
+    history.pushState = function () {
+      clearImageHints();
+      return _push.apply(this, arguments);
+    };
+    history.replaceState = function () {
+      clearImageHints();
+      return _replace.apply(this, arguments);
+    };
+    window.addEventListener('popstate', clearImageHints);
+  }
+
+  // v4.0.1 — Send blob to background via short-lived blob URL instead of
+  // base64 data URL through sendMessage. For a 4 MB cleaned PNG this drops
+  // a ~5.5 MB IPC payload to ~50 bytes — major perf win + dodges the IPC
+  // size cliff for very large images.
+  async function downloadBlobViaBackground(blob, filename) {
+    const blobUrl = URL.createObjectURL(blob);
+    try {
+      const result = await chrome.runtime.sendMessage({
+        action:   'downloadClean',
+        blobUrl,
+        filename: normalizeFilename(filename),
+      });
+      if (!result?.ok) throw new Error(result?.error || 'Download failed');
+      return result;
+    } finally {
+      // Revoke after Chrome has had time to start the download.
+      setTimeout(() => { try { URL.revokeObjectURL(blobUrl); } catch {} }, 60_000);
+    }
+  }
 
   // Push current enabled state to main world so it knows whether to intercept
   function syncSettings() {
@@ -80,7 +126,51 @@
     }, '*');
   }
 
-  // ── Per-URL processing lock ────────────────────────────────────────────────
+  // v4.0.8: Originals cache for the "View original" feature.
+  // Each clean operation registers the unprocessed image so the user can
+  // download it as a fallback if the AI output isn't what they wanted.
+  // LRU-bounded + 5-minute TTL — won't accumulate across long Gemini sessions.
+  const ORIGINALS_MAX = 12;
+  const ORIGINALS_TTL = 5 * 60_000;  // 5 minutes
+  const originalsCache = new Map();   // id → { blob, filename, ts }
+
+  function registerOriginal(rawBlob, filename) {
+    const id = 'o_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+    originalsCache.set(id, { blob: rawBlob, filename, ts: Date.now() });
+    // Evict oldest if over cap (Map preserves insertion order)
+    while (originalsCache.size > ORIGINALS_MAX) {
+      const oldest = originalsCache.keys().next().value;
+      originalsCache.delete(oldest);
+    }
+    // Auto-expire
+    setTimeout(() => originalsCache.delete(id), ORIGINALS_TTL);
+    return id;
+  }
+
+  async function downloadOriginal(id) {
+    const entry = originalsCache.get(id);
+    if (!entry) {
+      log('Original cache miss for id:', id);
+      toast('Original no longer available', 'error');
+      return false;
+    }
+    // Build "filename-original.ext" from the cleaned filename
+    const orig = entry.filename
+      .replace(/\.png$/i, '-original.png')
+      .replace(/\.jpg$/i, '-original.jpg')
+      .replace(/\.jpeg$/i, '-original.jpeg')
+      .replace(/\.webp$/i, '-original.webp');
+    try {
+      await downloadBlobViaBackground(entry.blob, orig);
+      toast('Original saved', 'success');
+      return true;
+    } catch (e) {
+      log('downloadOriginal failed:', e.message);
+      toast('Could not save original', 'error');
+      return false;
+    }
+  }
+
   // Prevents the same URL from being processed twice (e.g., if both the primary
   // intercept and the popup manual-download trigger simultaneously).
   const processingUrls = new Set();
@@ -110,7 +200,7 @@
         if (msg.type === 'progress') {
           // Forward progress to page toast so user sees something is happening
           toast(msg.msg, 'info');
-          log('LaMa bg:', msg.msg);
+          log('bg:', msg.msg);
           return;
         }
 
@@ -119,7 +209,7 @@
           if (msg.ok) {
             resolve(msg.inpainted512);
           } else {
-            reject(new Error(msg.error || 'LaMa inference failed'));
+            reject(new Error(msg.error || 'inference failed'));
           }
         }
       });
@@ -244,35 +334,36 @@
     }
     processingUrls.add(url);
 
-    toast('Removing watermark…', 'info');
+    // v4.0.7: persistent progress card for Pro mode (long wait).
+    // Quick mode is fast enough that the existing toast is sufficient.
+    const usePro = (cfg.method === 'ai');
+    const card = (usePro && cfg.showNotifications) ? showProgressCard() : null;
+    if (!card) toast('Removing watermark…', 'info');
+
     try {
       const rawBlob   = await fetchImage(url, cachedData, imgHint);
       const cleanBlob = await processImage(rawBlob);
 
-      // v3.6 FIX: Use chrome.downloads.download() via background instead of
-      // postMessage → doDownload(dataUrl) in main-world. The old path created
-      // a Chrome download entry that our own downloads.onCreated listener then
-      // detected as a "Gemini image download" and cancelled, because Chrome
-      // internally converts <a href="data:..." download> clicks into blob: URLs
-      // which don't match our data: URL skip-check.
-      // chrome.downloads.download() is privileged and tracked with a counter
-      // so onCreated knows to skip it.
-      const dlResult = await chrome.runtime.sendMessage({
-        action:   'downloadClean',
-        dataUrl:  await blobToDataURL(cleanBlob),
-        filename: normalizeFilename(filename),
-      });
-      if (!dlResult?.ok) throw new Error(dlResult?.error || 'chrome.downloads.download failed');
+      // v4.0.1: send blob via blob URL instead of giant base64 data URL.
+      // Old base64-through-sendMessage path was the perf bottleneck on large images.
+      await downloadBlobViaBackground(cleanBlob, filename);
 
       await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
       // Clear the click hint so it doesn't affect the next download if jslog fails
       delete document.documentElement.dataset.uaiClickedSrc;
       delete document.documentElement.dataset.uaiClickedTime;
-      toast('Watermark removed ✓', 'success');
+
+      // v4.0.8: cache the original so user can fall back to it if AI result
+      // isn't what they wanted. Available via "Download original" link in card.
+      const originalId = registerOriginal(rawBlob, filename);
+
+      if (card) card.success('Watermark removed · Saved', { originalId });
+      else      toast('Watermark removed ✓', 'success');
       log('Processed:', filename);
     } catch (err) {
       log('Processing error:', err.message);
-      toast('Processing failed — downloading original', 'error');
+      if (card) card.error(err.message || 'Processing failed');
+      else      toast('Processing failed — downloading original', 'error');
       window.postMessage({ gwrType: 'GWR_FALLBACK', url, filename }, '*');
     } finally {
       processingUrls.delete(url);
@@ -361,9 +452,9 @@
     //   4. findBestPageImageUrl() — DOM scan (last resort, often latest image)
     const clickedSrc  = document.documentElement.dataset.uaiClickedSrc  || null;
     const clickedTime = parseInt(document.documentElement.dataset.uaiClickedTime || '0', 10);
-    // 60-second window: user may hover other images after clicking download
-    // before background.js processes it. Click is always more precise than hover.
-    const clickHint   = (clickedSrc && Date.now() - clickedTime < 60000) ? clickedSrc : null;
+    // v4.0.1: 15-second window (was 60s). Combined with SPA navigation cleanup,
+    // this prevents stale clicks from earlier chats grabbing the wrong image.
+    const clickHint   = (clickedSrc && Date.now() - clickedTime < 15000) ? clickedSrc : null;
 
     const domSrc      = document.documentElement.dataset.uaiHoveredSrc  || null;
     const domTime     = parseInt(document.documentElement.dataset.uaiHoveredTime || '0', 10);
@@ -507,7 +598,7 @@
    */
   function preWarmLaMa() {
     if (cfg.method !== 'ai') return;
-    log('Pre-warming LaMa model in background…');
+    log('Pre-warming model in background…');
     let port;
     try {
       port = chrome.runtime.connect({ name: 'lama-inpaint' });
@@ -579,7 +670,7 @@
 
       if (region) {
         log('AI inpainting region:', JSON.stringify(region));
-        toast('Running LaMa inpainting…', 'info');
+        toast('Running inpainting…', 'info');
 
         // Expand crop with context padding for LaMa
         // ── Crop window — shift instead of clip ───────────────────────────────
@@ -644,11 +735,11 @@
           });
 
           compositeInpainted(ctx, inpainted512, cropX, cropY, cropW, cropH, softMask);
-          log('LaMa inpainting complete ✓');
+          log('inpainting complete ✓');
           toast('AI inpainting done ✓', 'success');
 
         } catch (lamaErr) {
-          log('LaMa failed, falling back to Smart:', lamaErr.message);
+          log('failed, falling back to Smart:', lamaErr.message);
           toast('AI failed — using Smart fallback', 'error');
           removeVisibleWatermark(ctx, W, H, 'smart');
         }
@@ -1186,19 +1277,22 @@
     let failed = 0;
     const errors = [];
 
+    // v4.0.7: single progress card that updates per image (Pro mode only)
+    const usePro = (cfg.method === 'ai');
+    const card = (usePro && cfg.showNotifications)
+      ? showProgressCard({ totalImages: images.length, currentIndex: 1 })
+      : null;
+
     for (let i = 0; i < images.length; i++) {
       const img = images[i];
       const filename = `unmark-ai-${i + 1}-of-${images.length}.png`;
+      if (card) card.setBatch(i + 1, images.length);
       try {
         const rawBlob   = await fetchImage(img.src, blobCache.get(img.src));
         const cleanBlob = await processImage(rawBlob);
 
-        const dlResult = await chrome.runtime.sendMessage({
-          action:   'downloadClean',
-          dataUrl:  await blobToDataURL(cleanBlob),
-          filename: normalizeFilename(filename),
-        });
-        if (!dlResult?.ok) throw new Error(dlResult?.error || 'Download failed');
+        // v4.0.1: blob URL transport (was: dataUrl base64)
+        await downloadBlobViaBackground(cleanBlob, filename);
 
         await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
 
@@ -1212,27 +1306,46 @@
       }
     }
 
+    if (card) {
+      if (succeeded === images.length) {
+        card.success(`${succeeded} of ${images.length} cleaned`);
+      } else if (succeeded > 0) {
+        card.success(`${succeeded} of ${images.length} cleaned · ${failed} failed`);
+      } else {
+        card.error('All cleans failed');
+      }
+    }
+
     return { ok: succeeded > 0, succeeded, failed, total: images.length, errors };
   };
 
   window.__UAI_processAndDownload = async function (url, filename) {
+    // v4.0.7: progress card for Pro mode (popup grid Clean button + context menu)
+    const usePro = (cfg.method === 'ai');
+    const card = (usePro && cfg.showNotifications) ? showProgressCard() : null;
     try {
       const rawBlob   = await fetchImage(url, blobCache.get(url), null);
       const cleanBlob = await processImage(rawBlob);
 
-      const dlResult = await chrome.runtime.sendMessage({
-        action:   'downloadClean',
-        dataUrl:  await blobToDataURL(cleanBlob),
-        filename: normalizeFilename(filename),
-      });
-      if (!dlResult?.ok) throw new Error(dlResult?.error || 'Download failed');
+      // v4.0.1: blob URL transport (was: dataUrl base64)
+      await downloadBlobViaBackground(cleanBlob, filename);
 
       await chrome.runtime.sendMessage({ action: 'watermarkRemoved' }).catch(() => {});
-      return { ok: true };
+      // v4.0.8: register original for "View original" link
+      const originalId = registerOriginal(rawBlob, filename);
+      if (card) card.success('Watermark removed · Saved', { originalId });
+      return { ok: true, originalId };
     } catch (e) {
       log('processAndDownload error:', e.message);
+      if (card) card.error(e.message || 'Processing failed');
       return { ok: false, error: e.message };
     }
+  };
+
+  // v4.0.8: callable from popup via chrome.scripting.executeScript so the
+  // popup grid can offer "View original" too.
+  window.__UAI_downloadOriginal = async function (id) {
+    return downloadOriginal(id);
   };
 
   // Keep old names as aliases so background.js fallback still works if page not refreshed
@@ -1257,6 +1370,239 @@
     const ext  = cfg.format === 'jpeg' ? '.jpg' : '.png';
     const base = name.replace(/\.(png|jpe?g|jpg|webp|gif|bmp|avif)$/i, '');
     return base + ext;
+  }
+
+  // ── Progress Card (v4.0.7) ─────────────────────────────────────────────────
+  //
+  // Persistent in-page progress card for long Pro-mode operations. Lives inside
+  // the Gemini tab itself (not the action popup), so it stays visible even when
+  // the popup isn't open — which is the common case for auto-clean.
+  //
+  // Why not auto-open the action popup?
+  //   Chrome's chrome.action.openPopup() is restricted to user gestures and
+  //   can't be reliably triggered from background work. And no API exists to
+  //   prevent the user from closing the action popup.
+  // Why not a separate window?
+  //   chrome.windows.create('popup') works but the user can always close it,
+  //   pulls focus from the workspace, and feels disruptive.
+  //
+  // The in-page card cannot be accidentally dismissed (pointer-events: none),
+  // sits in the bottom-right above any toast, and auto-fades on completion.
+
+  let activeProgressCard = null;
+
+  function showProgressCard({ totalImages = 1, currentIndex = 1 } = {}) {
+    // Replace any existing card (e.g. user triggered a second clean before
+    // the first one's success animation finished)
+    if (activeProgressCard) {
+      activeProgressCard.kill();
+      activeProgressCard = null;
+    }
+
+    // Inject keyframes once
+    if (!document.getElementById('uai-pc-styles')) {
+      const style = document.createElement('style');
+      style.id = 'uai-pc-styles';
+      style.textContent = `
+        @keyframes uai-pc-spin { to { transform: rotate(360deg); } }
+        @keyframes uai-pc-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+        @keyframes uai-pc-pop { 0% { transform: scale(.6); } 60% { transform: scale(1.15); } 100% { transform: scale(1); } }
+      `;
+      document.head.appendChild(style);
+    }
+
+    const card = document.createElement('div');
+    card.id = 'uai-progress-card';
+    Object.assign(card.style, {
+      position:        'fixed',
+      bottom:          '24px',
+      right:           '24px',
+      width:           '270px',
+      background:      'rgba(19, 19, 22, 0.96)',
+      backdropFilter:  'blur(10px) saturate(140%)',
+      WebkitBackdropFilter: 'blur(10px) saturate(140%)',
+      color:           '#FAFAFA',
+      fontFamily:      '-apple-system, BlinkMacSystemFont, "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif',
+      fontSize:        '13px',
+      lineHeight:      '1.4',
+      padding:         '13px 14px',
+      borderRadius:    '12px',
+      border:          '1px solid rgba(20, 184, 166, 0.35)',
+      boxShadow:       '0 12px 36px rgba(0,0,0,0.55), 0 2px 6px rgba(0,0,0,0.3)',
+      zIndex:          '2147483646',
+      transition:      'opacity 280ms ease, transform 280ms cubic-bezier(.4,0,.2,1), border-color 220ms ease',
+      opacity:         '0',
+      transform:       'translateY(12px) scale(0.98)',
+      pointerEvents:   'none',  // can't be clicked / dismissed by the user
+      WebkitFontSmoothing: 'antialiased',
+    });
+
+    const subtitle = totalImages > 1
+      ? `UnmarkAI · Pro · ${currentIndex} of ${totalImages}`
+      : 'UnmarkAI · Pro';
+
+    card.innerHTML = `
+      <div data-head style="display:flex;align-items:center;gap:9px;margin-bottom:10px;">
+        <div data-icon style="width:14px;height:14px;border:2px solid rgba(255,255,255,0.12);
+                              border-top-color:#2DD4BF;border-radius:50%;
+                              animation:uai-pc-spin 700ms linear infinite;flex-shrink:0;"></div>
+        <span data-title style="font-size:10.5px;font-weight:600;letter-spacing:.04em;
+                                 color:#A1A1AA;text-transform:uppercase;">${subtitle}</span>
+      </div>
+      <div data-phase style="font-size:13px;font-weight:500;color:#FAFAFA;
+                              letter-spacing:-.005em;margin-bottom:3px;">Starting…</div>
+      <div data-timer style="font-size:11px;font-family:ui-monospace,'SF Mono',Menlo,Monaco,monospace;
+                              color:#71717A;font-variant-numeric:tabular-nums;
+                              letter-spacing:.02em;">0s</div>
+    `;
+
+    document.body.appendChild(card);
+    requestAnimationFrame(() => {
+      card.style.opacity = '1';
+      card.style.transform = 'translateY(0) scale(1)';
+    });
+
+    const phaseEl = card.querySelector('[data-phase]');
+    const timerEl = card.querySelector('[data-timer]');
+    const headEl  = card.querySelector('[data-head]');
+    const startTime = Date.now();
+
+    // Phase timeline tuned for Pro (single-thread WASM LaMa on 512×512)
+    const phases = [
+      { until:  3, label: 'Detecting watermark'   },
+      { until:  6, label: 'Preparing image'       },
+      { until: 12, label: 'Loading AI engine'     },
+      { until: 35, label: 'Removing watermark'    },
+      { until: 60, label: 'Almost done'           },
+      { until: Infinity, label: 'Finishing up'    },
+    ];
+
+    const tickFn = () => {
+      const sec = Math.floor((Date.now() - startTime) / 1000);
+      const phase = phases.find(p => sec < p.until);
+      if (phaseEl.textContent !== phase.label + '…') {
+        phaseEl.textContent = phase.label + '…';
+      }
+      timerEl.textContent = sec >= 1 ? `${sec}s` : '0s';
+    };
+    tickFn();
+    let tickInterval = setInterval(tickFn, 500);
+
+    function fadeAndRemove(delay = 0) {
+      setTimeout(() => {
+        card.style.opacity = '0';
+        card.style.transform = 'translateY(8px) scale(0.98)';
+        setTimeout(() => { try { card.remove(); } catch {} }, 350);
+      }, delay);
+    }
+
+    const controller = {
+      // Hard kill (no animation) — used when replacing
+      kill() {
+        clearInterval(tickInterval);
+        try { card.remove(); } catch {}
+      },
+
+      // Update phase manually (e.g., for batch progress)
+      setPhase(label) {
+        if (phaseEl) phaseEl.textContent = label;
+      },
+
+      setBatch(currentIndex, totalImages) {
+        const titleEl = card.querySelector('[data-title]');
+        if (titleEl) {
+          titleEl.textContent = totalImages > 1
+            ? `UnmarkAI · Pro · ${currentIndex} of ${totalImages}`
+            : 'UnmarkAI · Pro';
+        }
+      },
+
+      success(msg = 'Watermark removed', { originalId = null } = {}) {
+        clearInterval(tickInterval);
+        const sec = Math.floor((Date.now() - startTime) / 1000);
+        card.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+        headEl.innerHTML = `
+          <div style="width:14px;height:14px;display:grid;place-items:center;
+                      background:#10B981;border-radius:50%;color:#fff;
+                      font-size:10px;font-weight:700;line-height:1;
+                      animation:uai-pc-pop 320ms cubic-bezier(.4,0,.2,1);">✓</div>
+          <span style="font-size:10.5px;font-weight:600;letter-spacing:.04em;
+                       color:#10B981;text-transform:uppercase;">UnmarkAI · Done</span>
+        `;
+        phaseEl.textContent = msg;
+        timerEl.textContent = `Completed in ${sec}s`;
+
+        // v4.0.8: optional "Download original" link if the caller cached the
+        // unprocessed image. Extends the card's lifetime so the user has time
+        // to read + click. Pointer-events re-enabled on the link itself only.
+        if (originalId) {
+          const link = document.createElement('button');
+          link.type = 'button';
+          Object.assign(link.style, {
+            display:        'inline-block',
+            marginTop:      '8px',
+            padding:        '5px 10px',
+            background:     'rgba(255,255,255,0.06)',
+            border:         '1px solid rgba(255,255,255,0.10)',
+            borderRadius:   '6px',
+            color:          '#A1A1AA',
+            fontSize:       '11px',
+            fontWeight:     '500',
+            fontFamily:     'inherit',
+            cursor:         'pointer',
+            pointerEvents:  'auto',  // re-enable for the link only
+            transition:     'background 160ms ease, color 160ms ease, border-color 160ms ease',
+            letterSpacing:  '-.005em',
+          });
+          link.textContent = 'Download original';
+          link.addEventListener('mouseenter', () => {
+            link.style.background = 'rgba(255,255,255,0.10)';
+            link.style.color = '#FAFAFA';
+            link.style.borderColor = 'rgba(255,255,255,0.18)';
+          });
+          link.addEventListener('mouseleave', () => {
+            link.style.background = 'rgba(255,255,255,0.06)';
+            link.style.color = '#A1A1AA';
+            link.style.borderColor = 'rgba(255,255,255,0.10)';
+          });
+          link.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            link.disabled = true;
+            link.style.opacity = '0.55';
+            link.textContent = 'Saving original…';
+            await downloadOriginal(originalId);
+            link.textContent = 'Original saved';
+            // Card fades shortly after
+            fadeAndRemove(800);
+          });
+          card.appendChild(link);
+          fadeAndRemove(8000);  // longer window so user can click
+        } else {
+          fadeAndRemove(1800);
+        }
+
+        if (activeProgressCard === controller) activeProgressCard = null;
+      },
+
+      error(msg = 'Something went wrong') {
+        clearInterval(tickInterval);
+        card.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+        headEl.innerHTML = `
+          <div style="width:14px;height:14px;display:grid;place-items:center;
+                      background:#EF4444;border-radius:50%;color:#fff;
+                      font-size:10px;font-weight:700;line-height:1;">!</div>
+          <span style="font-size:10.5px;font-weight:600;letter-spacing:.04em;
+                       color:#EF4444;text-transform:uppercase;">UnmarkAI · Failed</span>
+        `;
+        phaseEl.textContent = msg.length > 64 ? msg.slice(0, 61) + '…' : msg;
+        timerEl.textContent = '';
+        fadeAndRemove(4500);
+        if (activeProgressCard === controller) activeProgressCard = null;
+      },
+    };
+
+    activeProgressCard = controller;
+    return controller;
   }
 
   // ── Toast Notifications ────────────────────────────────────────────────────

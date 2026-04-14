@@ -1,5 +1,5 @@
 /**
- * UnmarkAI v4.0 — Popup Script (Production)
+ * UnmarkAI v4.0.6 — Popup Script (Production)
  *
  * Model states: idle → downloading (0–100%) → loading → ready | error
  * Auto-clean: cfg.autoIntercept — toggle exposed to user
@@ -42,13 +42,18 @@ let cfg = {
   showNotifications: true,
 };
 
+// v4.0.1: hold session count in state (was parsed from DOM textContent — fragile)
+let sessionCountUI = 0;
+
 // ── Model state ────────────────────────────────────────────────────────────
 let modelState = { status: 'unknown', progress: 0, error: null };
 let bgPort     = null;
+let bgPortRetries = 0;
 
 function connectBgPort() {
   try {
     bgPort = chrome.runtime.connect({ name: 'uai-popup' });
+    bgPortRetries = 0;
     bgPort.onMessage.addListener(msg => {
       if (msg.type !== 'modelStatus') return;
       const prev = modelState.status;
@@ -61,8 +66,18 @@ function connectBgPort() {
       // Refresh grid buttons when model becomes ready
       if (msg.status === 'ready' && prev !== 'ready') refreshGridButtons();
     });
-    bgPort.onDisconnect.addListener(() => { bgPort = null; });
-  } catch {}
+    bgPort.onDisconnect.addListener(() => {
+      bgPort = null;
+      // Auto-reconnect with exponential backoff (max 5 retries)
+      if (bgPortRetries++ < 5) {
+        setTimeout(connectBgPort, 1000 * bgPortRetries);
+      }
+    });
+  } catch {
+    if (bgPortRetries++ < 5) {
+      setTimeout(connectBgPort, 1000 * bgPortRetries);
+    }
+  }
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
@@ -106,29 +121,30 @@ function renderCfg() {
   methodPills.forEach(p => p.classList.toggle('active', p.dataset.method === cfg.method));
 
   if (cfg.method === 'ai') {
-    modelStatus.style.display = '';
+    modelStatus.hidden = false;
     checkModelAndWarm();
   } else {
-    modelStatus.style.display = 'none';
-    dlNotice.style.display    = 'none';
-    pillAiBadge.style.display = 'none';
+    modelStatus.hidden = true;
+    dlNotice.hidden    = true;
+    pillAiBadge.hidden = true;
   }
 }
 
 function renderStats(stats, session) {
+  sessionCountUI = session ?? 0;
   statTotal.textContent   = (stats?.totalRemoved ?? 0).toLocaleString();
-  statSession.textContent = (session ?? 0).toLocaleString();
+  statSession.textContent = sessionCountUI.toLocaleString();
 }
 
 function setStatus(on) {
   statusDot.classList.toggle('off', !on);
-  statusLabel.textContent = on ? 'Active on Gemini' : 'Paused';
+  statusLabel.textContent = on ? 'Watermark remover' : 'Paused';
 }
 
 function updateAutoCleanSub() {
   autoCleanSub.textContent = cfg.autoIntercept
-    ? 'Removes watermarks automatically when you click ↓ in Gemini'
-    : 'Auto-clean is off — use Scan page below to clean images manually';
+    ? 'Clean automatically when you save from Gemini'
+    : 'Manual mode — use Scan below to clean images';
 }
 
 function save() { chrome.storage.sync.set({ settings: { ...cfg } }).catch(() => {}); }
@@ -163,8 +179,8 @@ function renderModelStatus() {
       <div class="ms-body">
         <div class="ms-spinner"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title">Downloading AI model — ${pct}%</span>
-          <span class="ms-sub">One-time download · Saved permanently after this</span>
+          <span class="ms-title">Downloading model · ${pct}%</span>
+          <span class="ms-sub">First-time setup · ~198 MB · Saved permanently</span>
         </div>
       </div>
       <div class="ms-progress">
@@ -176,8 +192,8 @@ function renderModelStatus() {
       <div class="ms-body">
         <div class="ms-spinner"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title">Setting up AI engine…</span>
-          <span class="ms-sub">Almost ready — this only takes a few seconds</span>
+          <span class="ms-title">Initializing engine</span>
+          <span class="ms-sub">Almost ready</span>
         </div>
       </div>
       <div class="ms-progress">
@@ -190,19 +206,21 @@ function renderModelStatus() {
       <div class="ms-body">
         <div class="ms-dot green"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title ready">AI model ready</span>
-          <span class="ms-sub">LaMa neural inpainting active — best quality</span>
+          <span class="ms-title ready">Pro engine ready</span>
+          <span class="ms-sub">Neural inpainting active</span>
         </div>
       </div>`;
 
   } else if (status === 'error') {
     ms.classList.add('ms-state-error');
+    const errMsg = (error || 'Unknown error').toString();
+    const errShort = errMsg.length > 90 ? errMsg.slice(0, 87) + '…' : errMsg;
     modelStatusInner.innerHTML = `
       <div class="ms-body">
         <div class="ms-dot red"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title">Download failed</span>
-          <span class="ms-sub">Check your internet connection and try again</span>
+          <span class="ms-title">Model download failed</span>
+          <span class="ms-sub" title="${errMsg.replace(/"/g, '&quot;')}">${errShort}</span>
         </div>
         <button class="ms-retry" id="msRetryBtn">Retry</button>
       </div>`;
@@ -221,53 +239,52 @@ function renderModelStatus() {
       <div class="ms-body">
         <div class="ms-dot amber"></div>
         <div class="ms-text-wrap">
-          <span class="ms-title">AI model not downloaded</span>
-          <span class="ms-sub">Will download automatically (~198 MB, saved for future use)</span>
+          <span class="ms-title">Model not downloaded</span>
+          <span class="ms-sub">Will download once · ~198 MB</span>
         </div>
       </div>`;
   }
 }
 
 function updateDownloadNotice() {
-  // Show a notice strip inside scan section when model is busy
   const { status, progress } = modelState;
   if (cfg.method !== 'ai' || status === 'ready' || status === 'idle' || status === 'unknown') {
-    dlNotice.style.display = 'none';
+    dlNotice.hidden = true;
     return;
   }
 
-  dlNotice.style.display = '';
+  dlNotice.hidden = false;
   const pct = Math.min(99, progress || 0);
 
   if (status === 'downloading') {
     dlNoticeBar.innerHTML = `<div class="dl-notice-fill" style="width:${pct}%"></div>`;
-    dlNoticeText.textContent = `AI model downloading (${pct}%) — images will clean automatically once ready`;
+    dlNoticeText.textContent = `Downloading model · ${pct}% · Cleans will start once ready`;
   } else if (status === 'loading') {
     dlNoticeBar.innerHTML = `<div class="dl-notice-fill indeterminate" style="width:40%"></div>`;
-    dlNoticeText.textContent = 'Setting up AI engine — almost ready, hang tight';
+    dlNoticeText.textContent = 'Initializing engine · Almost ready';
   } else if (status === 'error') {
     dlNoticeBar.innerHTML = '';
-    dlNoticeText.textContent = 'AI download failed — Smart mode will be used as fallback';
+    dlNoticeText.textContent = 'Pro engine unavailable · Quick will be used instead';
   }
 }
 
 function updatePillBadge() {
   const { status, progress } = modelState;
   if (cfg.method !== 'ai' || status === 'ready') {
-    pillAiBadge.style.display = 'none';
+    pillAiBadge.hidden = true;
     return;
   }
   if (status === 'downloading') {
-    pillAiBadge.style.display = '';
+    pillAiBadge.hidden = false;
     pillAiBadge.textContent = `${Math.min(99, progress || 0)}%`;
   } else {
-    pillAiBadge.style.display = 'none';
+    pillAiBadge.hidden = true;
   }
 }
 
 function refreshGridButtons() {
   document.querySelectorAll('.img-clean-btn.state-loading').forEach(btn => {
-    btn.textContent = '✦ Clean';
+    btn.textContent = 'Clean';
     btn.classList.remove('state-loading');
     btn.disabled = false;
   });
@@ -281,7 +298,7 @@ enabledCb.addEventListener('change', () => {
   document.body.classList.toggle('paused', !cfg.enabled);
   setStatus(cfg.enabled); save();
   chrome.runtime.sendMessage({ action: 'toggleEnabled', enabled: cfg.enabled }).catch(() => {});
-  popupToast(cfg.enabled ? 'Extension enabled' : 'Extension paused', cfg.enabled ? 'success' : 'warning');
+  popupToast(cfg.enabled ? 'Enabled' : 'Paused', cfg.enabled ? 'success' : 'warning');
 });
 
 autoCleanCb.addEventListener('change', () => {
@@ -291,7 +308,7 @@ autoCleanCb.addEventListener('change', () => {
   save();
   chrome.runtime.sendMessage({ action: 'setAutoIntercept', autoIntercept: cfg.autoIntercept }).catch(() => {});
   popupToast(
-    cfg.autoIntercept ? 'Auto-clean on — downloads will be cleaned automatically' : 'Auto-clean off — use Scan page to clean manually',
+    cfg.autoIntercept ? 'Auto-clean on' : 'Auto-clean off',
     cfg.autoIntercept ? 'success' : 'warning'
   );
 });
@@ -301,15 +318,15 @@ methodPills.forEach(pill => pill.addEventListener('click', () => {
   methodPills.forEach(p => p.classList.toggle('active', p === pill));
 
   if (cfg.method === 'ai') {
-    modelStatus.style.display = '';
+    modelStatus.hidden = false;
     checkModelAndWarm();
   } else {
-    modelStatus.style.display = 'none';
-    dlNotice.style.display    = 'none';
-    pillAiBadge.style.display = 'none';
+    modelStatus.hidden = true;
+    dlNotice.hidden    = true;
+    pillAiBadge.hidden = true;
   }
   save();
-  popupToast(cfg.method === 'ai' ? '✦ Advance mode selected' : '⚡ Smart mode selected', 'success');
+  popupToast(cfg.method === 'ai' ? 'Pro engine selected' : 'Quick engine selected', 'success');
 }));
 
 resetBtn.addEventListener('click', async () => {
@@ -330,8 +347,8 @@ scanBtn.addEventListener('click', scanPageImages);
 
 async function scanPageImages() {
   scanBtn.disabled = true; scanBtn.textContent = '…';
-  imageGrid.style.display = 'none';
-  if (dlAllBtn) dlAllBtn.style.display = 'none';
+  imageGrid.hidden = true;
+  if (dlAllBtn) dlAllBtn.hidden = true;
   scanHint.textContent = 'Scanning…';
   scanHint.classList.remove('highlight');
 
@@ -341,7 +358,7 @@ async function scanPageImages() {
 
     const isGemini = tab.url?.includes('gemini.google.com') || tab.url?.includes('aistudio.google.com');
     if (!isGemini) {
-      scanHint.textContent = 'Open Gemini or AI Studio first';
+      scanHint.textContent = 'Open Gemini or AI Studio to scan';
       return;
     }
 
@@ -352,7 +369,7 @@ async function scanPageImages() {
 
     const images = results?.[0]?.result ?? [];
     if (!images.length) {
-      scanHint.textContent = 'No images found yet — generate one in Gemini first';
+      scanHint.textContent = 'No images found · Generate one in Gemini first';
       return;
     }
 
@@ -360,18 +377,19 @@ async function scanPageImages() {
     scanHint.classList.add('highlight');
 
     if (dlAllBtn && images.length > 1) {
-      dlAllBtn.style.display = ''; dlAllBtn.textContent = `Clean all (${images.length})`;
+      dlAllBtn.hidden = false;
+      dlAllBtn.textContent = `Clean all (${images.length})`;
       dlAllBtn.disabled = false; dlAllBtn._tabId = tab.id;
     }
 
     renderImageGrid(images, tab.id);
-    imageGrid.style.display = 'grid';
+    imageGrid.hidden = false;
     if (cfg.method === 'ai') { checkModelAndWarm(); updateDownloadNotice(); }
 
   } catch {
-    scanHint.textContent = 'Could not scan — try refreshing the Gemini page';
+    scanHint.textContent = 'Scan failed · Try refreshing the page';
   } finally {
-    scanBtn.disabled = false; scanBtn.textContent = 'Scan page';
+    scanBtn.disabled = false; scanBtn.textContent = 'Scan';
   }
 }
 
@@ -381,31 +399,47 @@ if (dlAllBtn) {
     if (cfg.method === 'ai' && !isModelReady()) {
       popupToast(
         modelState.status === 'downloading'
-          ? `AI model downloading ${modelState.progress}% — please wait`
-          : 'AI engine is still setting up — please wait',
+          ? `Model still downloading · ${modelState.progress}%`
+          : 'Model initializing',
         'warning'
       );
       return;
     }
-    dlAllBtn.disabled = true; dlAllBtn.textContent = 'Processing…';
+    dlAllBtn.disabled = true;
     const tabId = dlAllBtn._tabId;
     if (!tabId) { dlAllBtn.textContent = 'Error'; return; }
+
+    // v4.0.6: live elapsed counter so user knows the batch is alive.
+    // Multi-image AI cleans can take several minutes total.
+    const baseLabel = cfg.method === 'ai' ? 'Cleaning' : 'Cleaning';
+    dlAllBtn.textContent = `${baseLabel}…`;
+    const startTime = Date.now();
+    const dlTick = setInterval(() => {
+      if (!dlAllBtn) { clearInterval(dlTick); return; }
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      dlAllBtn.textContent = `${baseLabel} · ${elapsed}s`;
+    }, 1000);
+
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId },
         func: () => (window.__UAI_downloadAll?.()) ?? { ok: false },
       });
+      clearInterval(dlTick);
       const r = results?.[0]?.result;
       if (r?.ok) {
-        dlAllBtn.textContent = `✓ ${r.succeeded} cleaned`;
-        const cur = parseInt(statSession.textContent.replace(/,/g,''), 10) || 0;
-        statSession.textContent = (cur + r.succeeded).toLocaleString(); bump(statSession);
-        popupToast(`✓ ${r.succeeded} image${r.succeeded !== 1 ? 's' : ''} cleaned`, 'success');
+        dlAllBtn.textContent = `${r.succeeded} done`;
+        sessionCountUI += r.succeeded;
+        statSession.textContent = sessionCountUI.toLocaleString(); bump(statSession);
+        popupToast(`${r.succeeded} image${r.succeeded !== 1 ? 's' : ''} cleaned`, 'success');
       } else {
-        dlAllBtn.textContent = 'Failed'; dlAllBtn.disabled = false;
-        popupToast('Something went wrong — try again', 'error');
+        dlAllBtn.textContent = 'Retry'; dlAllBtn.disabled = false;
+        popupToast('Clean failed · Try again', 'error');
       }
-    } catch { dlAllBtn.textContent = 'Error'; dlAllBtn.disabled = false; }
+    } catch {
+      clearInterval(dlTick);
+      dlAllBtn.textContent = 'Retry'; dlAllBtn.disabled = false;
+    }
   });
 }
 
@@ -432,10 +466,10 @@ function renderImageGrid(images, tabId) {
 
     if (notReady) {
       const s = modelState.status;
-      btn.textContent = s === 'downloading' ? `↓ ${modelState.progress}%` : '↓ Loading…';
+      btn.textContent = s === 'downloading' ? `${modelState.progress}%` : 'Loading';
       btn.classList.add('state-loading');
     } else {
-      btn.textContent = isAi ? '✦ Clean' : '↓ Clean';
+      btn.textContent = 'Clean';
     }
 
     btn.addEventListener('click', async e => {
@@ -446,8 +480,8 @@ function renderImageGrid(images, tabId) {
       if (cfg.method === 'ai' && !isModelReady()) {
         popupToast(
           modelState.status === 'downloading'
-            ? `AI model downloading ${modelState.progress}% — hang tight`
-            : 'AI engine is setting up — almost ready',
+            ? `Model still downloading · ${modelState.progress}%`
+            : 'Model initializing',
           'warning'
         );
         return;
@@ -460,8 +494,40 @@ function renderImageGrid(images, tabId) {
       proc.className = 'processing-overlay';
       proc.innerHTML = `
         <div class="processing-spinner"></div>
-        <div class="processing-label">${cfg.method === 'ai' ? 'Running AI\ninpainting…' : 'Cleaning…'}</div>`;
+        <div class="processing-label" data-phase></div>
+        <div class="processing-timer" data-timer></div>`;
       card.appendChild(proc);
+
+      // v4.0.6: phase-aware progress overlay. Pro mode takes 30-40s; a static
+      // label looks frozen. Cycle through honest phase labels based on
+      // elapsed time, with a small monospace seconds counter underneath.
+      const phaseEl = proc.querySelector('[data-phase]');
+      const timerEl = proc.querySelector('[data-timer]');
+      const startTime = Date.now();
+      let procTick = null;
+
+      if (cfg.method === 'ai') {
+        const phases = [
+          { until:  3, label: 'Detecting watermark' },
+          { until:  6, label: 'Preparing image'     },
+          { until: 12, label: 'Loading AI engine'   },
+          { until: 35, label: 'Removing watermark'  },
+          { until: 60, label: 'Almost done'         },
+          { until: Infinity, label: 'Finishing up'  },
+        ];
+        const tickFn = () => {
+          const sec = Math.floor((Date.now() - startTime) / 1000);
+          const phase = phases.find(p => sec < p.until);
+          phaseEl.textContent = phase.label + '…';
+          timerEl.textContent = sec >= 1 ? `${sec}s` : '';
+        };
+        tickFn();
+        procTick = setInterval(tickFn, 500);
+      } else {
+        // Quick mode is near-instant
+        phaseEl.textContent = 'Cleaning…';
+        timerEl.textContent = '';
+      }
 
       try {
         const res = await chrome.scripting.executeScript({
@@ -473,6 +539,7 @@ function renderImageGrid(images, tabId) {
           args: [img.src, `unmark-ai-${Date.now()}.png`],
         });
 
+        if (procTick) clearInterval(procTick);
         proc.remove();
         const result = res?.[0]?.result;
 
@@ -480,19 +547,51 @@ function renderImageGrid(images, tabId) {
           const badge = document.createElement('div');
           badge.className = 'img-done-badge'; badge.textContent = '✓';
           card.appendChild(badge);
-          btn.textContent = '✓ Done'; btn.style.background = 'rgba(16,185,129,0.12)';
-          btn.style.color = 'var(--green)'; btn.style.borderColor = 'rgba(16,185,129,0.2)';
-          // Remove overlay so badge is visible
-          overlay.style.display = 'none';
-          const cur = parseInt(statSession.textContent.replace(/,/g,''),10)||0;
-          statSession.textContent = (cur + 1).toLocaleString(); bump(statSession);
+          btn.textContent = 'Done';
+          btn.style.background = 'rgba(16,185,129,0.15)';
+          btn.style.color = 'var(--green)';
+          btn.style.borderColor = 'rgba(16,185,129,0.3)';
+          sessionCountUI += 1;
+          statSession.textContent = sessionCountUI.toLocaleString(); bump(statSession);
+
+          // v4.0.8: "View original" link below the Done button
+          if (result.originalId) {
+            const originalLink = document.createElement('button');
+            originalLink.className = 'img-original-link';
+            originalLink.textContent = 'View original';
+            originalLink.title = 'Download the unprocessed image';
+            originalLink.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              originalLink.disabled = true;
+              originalLink.textContent = 'Saving…';
+              try {
+                const r = await chrome.scripting.executeScript({
+                  target: { tabId },
+                  func: (id) => window.__UAI_downloadOriginal?.(id) ?? false,
+                  args: [result.originalId],
+                });
+                const ok = r?.[0]?.result;
+                originalLink.textContent = ok ? 'Saved ✓' : 'Failed';
+                if (!ok) {
+                  popupToast('Original no longer available', 'error');
+                  originalLink.disabled = false;
+                  originalLink.textContent = 'Retry original';
+                }
+              } catch {
+                originalLink.textContent = 'Failed';
+                popupToast('Could not save original', 'error');
+              }
+            });
+            overlay.appendChild(originalLink);
+          }
         } else {
-          btn.textContent = '↺ Retry'; btn.disabled = false;
+          btn.textContent = 'Retry'; btn.disabled = false;
           btn.classList.add('state-loading');
-          popupToast('Cleaning failed — try again', 'error');
+          popupToast('Clean failed · Try again', 'error');
         }
       } catch {
-        proc.remove(); btn.textContent = '↺ Retry'; btn.disabled = false;
+        if (procTick) clearInterval(procTick);
+        proc.remove(); btn.textContent = 'Retry'; btn.disabled = false;
       }
     });
 

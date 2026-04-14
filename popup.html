@@ -3,119 +3,121 @@
 <head>
   <meta charset="UTF-8"/>
   <title>UnmarkAI</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="popup.css"/>
 </head>
 <body>
 
-  <!-- ── Header ── -->
+  <!-- ── Header ───────────────────────────────────────────────────── -->
   <header class="header">
     <div class="brand">
-      <svg class="brand-mark" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="14" cy="14" r="12" fill="rgba(45,212,191,0.07)" stroke="rgba(45,212,191,0.18)" stroke-width="1"/>
-        <path d="M14 3.5L15.4 12.6L24 14L15.4 15.4L14 24.5L12.6 15.4L4 14L12.6 12.6Z" fill="#2DD4BF"/>
-        <circle cx="14" cy="14" r="2" fill="white" opacity="0.55"/>
-      </svg>
-      <div class="brand-copy">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2L13.2 9.8L21 11L13.2 12.2L12 20L10.8 12.2L3 11L10.8 9.8Z" fill="currentColor"/>
+        </svg>
+      </div>
+      <div class="brand-text">
         <span class="brand-name">UnmarkAI</span>
-        <span class="brand-sub" id="statusLabel">Active on Gemini</span>
+        <span class="brand-sub" id="statusLabel">Watermark remover</span>
       </div>
     </div>
-    <div class="header-right">
-      <span class="pip" id="statusDot"></span>
-      <label class="master-sw" title="Enable / disable extension">
-        <input type="checkbox" id="enabledCheckbox"/>
-        <span class="ms-rail"><span class="ms-thumb"></span></span>
-      </label>
-    </div>
+    <label class="switch" title="Enable extension">
+      <input type="checkbox" id="enabledCheckbox"/>
+      <span class="switch-rail"><span class="switch-thumb"></span></span>
+    </label>
+    <!-- statusDot kept for popup.js compat (off-screen, not visually used) -->
+    <span class="sr-only" id="statusDot"></span>
   </header>
 
-  <!-- ── Stats ── -->
-  <div class="stats">
+  <!-- ── Stats ────────────────────────────────────────────────────── -->
+  <section class="stats">
     <div class="stat">
-      <span class="stat-n" id="statTotal">0</span>
-      <span class="stat-l">total cleaned</span>
+      <span class="stat-num" id="statTotal">0</span>
+      <span class="stat-label">All time</span>
     </div>
-    <span class="stat-div"></span>
     <div class="stat">
-      <span class="stat-n" id="statSession">0</span>
-      <span class="stat-l">this session</span>
+      <span class="stat-num" id="statSession">0</span>
+      <span class="stat-label">Session</span>
     </div>
-  </div>
+  </section>
 
-  <!-- ── Method ── -->
-  <section class="method-section" id="methodSection">
-    <div class="section-label">Cleaning method</div>
-    <div class="method-pills">
-      <button class="method-pill" data-method="smart" id="pillSmart">
-        <div class="pill-icon-wrap">
-          <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-            <path d="M6.5 1L7.5 5.5L12 6.5L7.5 7.5L6.5 12L5.5 7.5L1 6.5L5.5 5.5Z" fill="currentColor"/>
+  <!-- ── Engine selector ──────────────────────────────────────────── -->
+  <section class="block" id="methodSection">
+    <div class="block-label">Engine</div>
+    <div class="engine-grid">
+
+      <button class="engine-card method-pill" data-method="smart" id="pillSmart">
+        <div class="engine-icon">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+            <path d="M9 1L2 9h5l-1 6 7-8H8l1-6z" fill="currentColor"/>
           </svg>
         </div>
-        <div class="pill-text">
-          <span class="pill-name">Smart</span>
-          <span class="pill-desc">Fast · No download</span>
+        <div class="engine-meta">
+          <span class="engine-name">Quick</span>
+          <span class="engine-desc">Algorithmic · Instant</span>
         </div>
       </button>
-      <button class="method-pill" data-method="ai" id="pillAi">
-        <div class="pill-icon-wrap">
-          <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-            <path d="M6.5 0.5L7.9 4.6L12 6.5L7.9 8.4L6.5 12.5L5.1 8.4L1 6.5L5.1 4.6Z" fill="currentColor"/>
+
+      <button class="engine-card method-pill" data-method="ai" id="pillAi">
+        <div class="engine-icon">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+            <path d="M8 1L9.4 6.6L15 8L9.4 9.4L8 15L6.6 9.4L1 8L6.6 6.6Z" fill="currentColor"/>
           </svg>
         </div>
-        <div class="pill-text">
-          <span class="pill-name">Advance</span>
-          <span class="pill-desc">AI · Best quality</span>
+        <div class="engine-meta">
+          <span class="engine-name">Pro</span>
+          <span class="engine-desc">AI model · Best quality</span>
         </div>
-        <span class="pill-badge" id="pillAiBadge" style="display:none"></span>
+        <span class="engine-badge" id="pillAiBadge" hidden></span>
       </button>
+
     </div>
 
-    <!-- AI model status — shown when Advance is active -->
-    <div class="model-status" id="modelStatus" style="display:none">
+    <!-- Model status — shown only when Pro is active -->
+    <div class="model-status" id="modelStatus" hidden>
       <div id="modelStatusInner"></div>
     </div>
   </section>
 
-  <!-- ── Settings ── -->
-  <section class="settings-section" id="settingsSection">
-    <div class="toggle-row">
-      <div class="toggle-info">
-        <span class="toggle-label">Auto-clean on download</span>
-        <span class="toggle-sub" id="autoCleanSub">Removes watermarks automatically when you click ↓ in Gemini</span>
+  <!-- ── Auto-clean ───────────────────────────────────────────────── -->
+  <section class="block">
+    <div class="row">
+      <div class="row-meta">
+        <span class="row-title">Auto-clean</span>
+        <span class="row-desc" id="autoCleanSub">Clean automatically when you save from Gemini</span>
       </div>
-      <label class="sw">
+      <label class="switch switch-sm">
         <input type="checkbox" id="autoCleanCheckbox"/>
-        <span class="sw-rail"><span class="sw-thumb"></span></span>
+        <span class="switch-rail"><span class="switch-thumb"></span></span>
       </label>
     </div>
   </section>
 
-  <!-- ── Scan ── -->
-  <section class="scan" id="scanSection">
-    <div class="scan-row">
-      <div class="scan-hint-wrap">
-        <span class="scan-hint" id="scanHint">Open a Gemini page to scan for images</span>
-      </div>
+  <!-- ── Scan / images ────────────────────────────────────────────── -->
+  <section class="block scan-block" id="scanSection">
+    <div class="scan-head">
+      <span class="scan-status" id="scanHint">Scan a Gemini page for images</span>
       <div class="scan-actions">
-        <button class="btn-ghost" id="dlAllBtn" style="display:none">Clean all</button>
-        <button class="btn-primary" id="scanBtn">Scan page</button>
+        <button class="btn btn-ghost" id="dlAllBtn" hidden>Clean all</button>
+        <button class="btn btn-primary" id="scanBtn">Scan</button>
       </div>
     </div>
-    <!-- Model downloading notice — shown in scan area when model is busy -->
-    <div class="dl-notice" id="dlNotice" style="display:none">
+
+    <!-- Inline downloading notice — appears while model is busy -->
+    <div class="dl-notice" id="dlNotice" hidden>
       <div class="dl-notice-bar" id="dlNoticeBar"></div>
       <span class="dl-notice-text" id="dlNoticeText"></span>
     </div>
-    <div class="img-grid" id="imageGrid" style="display:none"></div>
+
+    <div class="img-grid" id="imageGrid" hidden></div>
   </section>
 
-  <!-- ── Footer ── -->
+  <!-- ── Footer ───────────────────────────────────────────────────── -->
   <footer class="footer">
-    <button class="lnk-btn" id="resetBtn">Reset stats</button>
-    <span class="ver">v4.0.0</span>
+    <button class="footer-link" id="resetBtn">Reset stats</button>
+    <a class="footer-link" id="privacyLink"
+       href="https://github.com/mabdsh/lama_fp32/blob/main/PRIVACY.md"
+       target="_blank" rel="noopener">Privacy</a>
+    <span class="footer-version">v4.0.9</span>
   </footer>
 
   <script src="popup.js"></script>

@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#141416" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#000000"   stop-opacity="0.85"/>
+    </linearGradient>
+
+    <radialGradient id="sparkGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#D4D4D8" stop-opacity="1"/>
+      <stop offset="55%"  stop-color="#A1A1AA" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#A1A1AA" stop-opacity="0.95"/>
+    </radialGradient>
+
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#D4D4D8" stop-opacity="0.35"/>
+      <stop offset="60%"  stop-color="#A1A1AA" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#A1A1AA" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background squircle -->
+  <rect x="2" y="2" width="124" height="124" rx="28" ry="28"
+        fill="url(#bgGrad)"
+        stroke="#52525B" stroke-opacity="0.55" stroke-width="1.5"/>
+
+  <!-- Soft glow behind the sparkle -->
+  <circle cx="64" cy="64" r="42" fill="url(#glow)"/>
+
+  <!-- Outer faint sparkle (decorative, only visible at larger sizes) -->
+  <path d="M 96 30 L 99 38 L 107 41 L 99 44 L 96 52 L 93 44 L 85 41 L 93 38 Z"
+        fill="#71717A" fill-opacity="0.40"/>
+
+  <!-- Main 4-point sparkle, centered -->
+  <!-- Made of two crossed diamonds with subtle waist for elegance -->
+  <path d="M 64 18
+           L 70 58
+           L 110 64
+           L 70 70
+           L 64 110
+           L 58 70
+           L 18 64
+           L 58 58
+           Z"
+        fill="url(#sparkGrad)"/>
+
+  <!-- Center hot-spot (depth) -->
+  <circle cx="64" cy="64" r="4.5"
+          fill="#FFFFFF" fill-opacity="0.55"/>
+</svg>
