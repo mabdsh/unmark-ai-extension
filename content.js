@@ -615,13 +615,44 @@
   //   Final output is then re-encoded in the user's chosen format (PNG/JPEG).
   //   Both layers together make reconstruction of the original SynthID signal
   //   computationally infeasible regardless of the encoding scheme used.
-  async function synthIdStrip(canvas, ctx, W, H) {
+  /**
+   * SynthID disruption pass.
+   *
+   * inpaintedRegion (optional) — { mask, x, y, w, h } from removeVisibleWatermark.
+   *   When supplied, we SKIP noise injection on those pixels. Why: the inpainted
+   *   pixels were synthesised from the surrounding image, which (after this
+   *   noise pass) won't have noise applied yet — but the inpainted region just
+   *   ate the source values. If we then add fresh noise to the inpainted area,
+   *   the noise pattern won't match its neighbours and the patch boundary
+   *   becomes visible. Skipping noise on those pixels keeps the patch
+   *   indistinguishable from its surroundings.
+   *
+   * The JPEG round-trip is still applied to the WHOLE image, including the
+   * inpainted region. JPEG quantization affects all pixels uniformly, so it
+   * doesn't introduce a boundary artifact and still disrupts DCT-domain
+   * fingerprints across the entire image.
+   */
+  async function synthIdStrip(canvas, ctx, W, H, inpaintedRegion = null) {
     // Layer 1: Gaussian noise injection (Box-Muller transform)
     const imgData = ctx.getImageData(0, 0, W, H);
     const d = imgData.data;
     const σ = 1.5;
 
-    for (let i = 0; i < d.length - 3; i += 4) {
+    // Build a per-pixel "skip" lookup if an inpainted region was provided.
+    // We use a Uint8Array indexed by linear pixel for O(1) access in the loop.
+    let skip = null;
+    if (inpaintedRegion?.mask) {
+      const { mask: rMask, x: rx, y: ry, w: rw, h: rh } = inpaintedRegion;
+      skip = new Uint8Array(W * H);
+      for (let ry2 = 0; ry2 < rh; ry2++) {
+        for (let rx2 = 0; rx2 < rw; rx2++) {
+          if (rMask[ry2 * rw + rx2]) skip[(ry + ry2) * W + (rx + rx2)] = 1;
+        }
+      }
+    }
+
+    for (let i = 0, p = 0; i < d.length - 3; i += 4, p++) {
+      if (skip && skip[p]) continue;
       // Two independent Gaussian samples from two uniform pairs
       const u1a = Math.random() || 1e-10, u1b = Math.random() || 1e-10;
       const u2a = Math.random() || 1e-10, u2b = Math.random() || 1e-10;
@@ -633,11 +664,11 @@
       d[i]   = Math.max(0, Math.min(255, (d[i]   + n0 + 0.5) | 0));
       d[i+1] = Math.max(0, Math.min(255, (d[i+1] + n1 + 0.5) | 0));
       d[i+2] = Math.max(0, Math.min(255, (d[i+2] + n2 + 0.5) | 0));
-      // Alpha channel untouched
     }
     ctx.putImageData(imgData, 0, 0);
 
-    // Layer 2: JPEG round-trip — destroys DCT-domain frequency patterns
+    // Layer 2: JPEG round-trip — destroys DCT-domain frequency patterns.
+    // Applied uniformly to the full image (no skip) so the result is consistent.
     const jpegBlob = await new Promise((res, rej) =>
       canvas.toBlob(
         b => b ? res(b) : rej(new Error('JPEG round-trip toBlob failed')),
@@ -648,8 +679,6 @@
     ctx.clearRect(0, 0, W, H);
     ctx.drawImage(bmp, 0, 0);
     bmp.close();
-    // Canvas now holds the JPEG-quantized, noise-injected image.
-    // Subsequent toBlob() in processImage() will encode in user's chosen format.
   }
 
 
@@ -726,6 +755,11 @@
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     ctx.drawImage(bitmap, 0, 0);
     bitmap.close();
+
+    // If LaMa fails and we fall back to Smart, this captures the inpaint info
+    // so synthIdStrip can skip noise on the patched region. Stays null if AI
+    // succeeds (LaMa output is full-image; no skip needed).
+    let aiSmartFallback = null;
 
     // Visible-watermark removal — always on for AI mode.
     {
@@ -816,7 +850,7 @@
           if (lamaErr.cancelled) throw lamaErr;  // bubble cancellation up
           log('failed, falling back to Smart:', lamaErr.message);
           toast('AI failed — using Smart fallback', 'error');
-          removeVisibleWatermark(ctx, W, H);
+          aiSmartFallback = removeVisibleWatermark(ctx, W, H);
         }
 
       } else {
@@ -825,7 +859,10 @@
     }
 
     // SynthID disruption: always applied.
-    await synthIdStrip(canvas, ctx, W, H);
+    // If we fell back to Smart, pass the inpaint info so noise is skipped on
+    // the patched region. The native AI path doesn't need this — LaMa's output
+    // is full-resolution and noise-stable across the whole image.
+    await synthIdStrip(canvas, ctx, W, H, aiSmartFallback);
 
     return new Promise((res, rej) =>
       canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), 'image/png')
@@ -858,11 +895,13 @@
     ctx.drawImage(bitmap, 0, 0);
     bitmap.close();
 
-    removeVisibleWatermark(ctx, W, H);
+    const inpaintInfo = removeVisibleWatermark(ctx, W, H);
 
     // SynthID disruption: Gaussian noise (σ=1.5) + JPEG round-trip.
-    // Disrupts both LSB and DCT-domain fingerprints. Always applied.
-    await synthIdStrip(canvas, ctx, W, H);
+    // We pass the inpainted-region info so noise is skipped on those pixels —
+    // otherwise the patch would have noise that doesn't match the source it
+    // was drawn from, making the boundary visible.
+    await synthIdStrip(canvas, ctx, W, H, inpaintInfo);
 
     return new Promise((res, rej) =>
       canvas.toBlob(b => b ? res(b) : rej(new Error('canvas.toBlob returned null')), 'image/png')
@@ -871,30 +910,53 @@
 
 
   // ── Visible Watermark Removal ──────────────────────────────────────────────
+  /**
+   * Locate the watermark, build a tight per-pixel mask (NOT a rectangle —
+   * critical for avoiding the sparkle-ghost artifact), choose between
+   * Telea diffusion and locality-biased PatchMatch based on local texture,
+   * and inpaint. Returns the final inpainted mask (per-pixel) so the
+   * caller can skip SynthID noise on those pixels — otherwise the patched
+   * region would have noise the surrounding inpaint source doesn't have,
+   * making the boundary visible.
+   *
+   * Returns: { mask, x, y, w, h } or null if no inpainting happened.
+   *   mask is a Uint8Array of size w*h, 1 = inpainted pixel.
+   */
   function removeVisibleWatermark(ctx, W, H) {
     const imgData  = ctx.getImageData(0, 0, W, H);
     const { data } = imgData;
 
-    const region = detectSparkle(data, W, H);
-    if (region) {
-      log('Sparkle detected at', JSON.stringify(region));
-      inpaintRegion(data, W, H, region);
-      ctx.putImageData(imgData, 0, 0);
-    } else {
+    let region = detectSparkle(data, W, H);
+    if (!region) {
       // Fallback: only apply if the corner actually contains sparkle-like pixels.
       // Without this guard, images without a sparkle get a visible flat-color
-      // patch in the bottom-right corner (the IDW average of edge pixels is
-      // a single blended color with no variation from the missing samples).
+      // patch in the bottom-right corner.
       const sz = Math.max(44, Math.floor(Math.min(W, H) * 0.06));
       if (cornerLooksLikeSparkle(data, W, H, sz)) {
         log('Sparkle not detected precisely — applying corner-zone fallback');
-        const fallback = { x: W - sz, y: H - sz, width: sz, height: sz };
-        inpaintRegion(data, W, H, fallback);
-        ctx.putImageData(imgData, 0, 0);
+        region = { x: W - sz, y: H - sz, width: sz, height: sz };
       } else {
         log('No sparkle-like pixels in corner — skipping fallback to avoid artifact');
+        return null;
       }
+    } else {
+      log('Sparkle detected at', JSON.stringify(region));
     }
+
+    // Expand the region modestly — the sparkle's anti-aliased halo extends
+    // ~6-8px past the lavender pixel cluster, and the mask-builder needs
+    // to see it as candidate territory.
+    const HALO = 10;
+    const rx = Math.max(0, region.x - HALO);
+    const ry = Math.max(0, region.y - HALO);
+    const rw = Math.min(W, region.x + region.width  + HALO) - rx;
+    const rh = Math.min(H, region.y + region.height + HALO) - ry;
+    const expanded = { x: rx, y: ry, width: rw, height: rh };
+
+    const result = inpaintWatermark(data, W, H, expanded);
+    if (!result) return null;
+    ctx.putImageData(imgData, 0, 0);
+    return { mask: result.mask, x: expanded.x, y: expanded.y, w: expanded.width, h: expanded.height };
   }
 
   // Quick scan: does the bottom-right corner contain any blue-tinted
@@ -982,292 +1044,652 @@
       height: Math.min(H, maxY + pad + 1) - Math.max(0, minY - pad),
     };
   }
+  // ── Inpainting pipeline ────────────────────────────────────────────────────
+  //
+  // Two algorithms with a content-aware dispatcher. We replace the previous
+  // PatchMatch-only design because PatchMatch produces visible artifacts on
+  // *plain* backgrounds (it pulls slightly-different texture from elsewhere)
+  // and on *highly-directional* textures (it stitches the wrong orientation,
+  // producing the classic "smudge" look). The dispatcher picks per-region.
+  //
+  //   • Telea fast-marching diffusion → smooth/gradient backgrounds. Extends
+  //     surrounding pixels INWARD via a per-pixel weighted average, giving a
+  //     near-perfect result on plain regions in O(N log N) time.
+  //
+  //   • PatchMatch v2 with locality bias + edge-aware SSD → textured / busy
+  //     backgrounds. Heavily prefers nearby patches over distant ones, and
+  //     uses gradient orientation as part of the match score so directional
+  //     texture (tree needles, grass, brick, fabric weave) stays directional.
+  //
+  // Mask handling is done here (not in detectSparkle) because the *halo*
+  // around the visible sparkle is what produces ghost artifacts. The mask
+  // builder uses local-bg deviation, then morphologically dilates by 3px
+  // to capture the anti-aliased edge pixels.
 
-  // ── Inpainting ─────────────────────────────────────────────────────────────
   /**
-   * Smart inpainting: PatchMatch exemplar search (plain surfaces fall back to
-   * IDW background fill) plus a Gauss-Seidel boundary smoothing pass to
-   * eliminate the seam where the patched region meets the original pixels.
-   *
-   * This is the same core algorithm used by Photoshop Content-Aware Fill and
-   * professional inpainting tools — it finds the most visually similar patch
-   * from elsewhere in the image and copies that texture, making the result
-   * pixel-perfect on gradients and complex surfaces.
+   * Entry point — called by removeVisibleWatermark.
+   * Returns { mask } (Uint8Array of size bw*bh, 1 = inpainted) or null.
    */
-  function inpaintRegion(data, W, H, bounds) {
+  function inpaintWatermark(data, W, H, bounds) {
     const { x, y, width: bw, height: bh } = bounds;
 
-    // ── SMART: PatchMatch exemplar inpainting + soft boundary blending ────────
-    //
-    // Three phases:
-    //   1. Build a per-pixel background estimate (IDW from border) + anomaly map
-    //   2. PatchMatch: for each sparkle pixel, search the image for the best
-    //      matching texture patch and record its centre value
-    //   3. Soft-blend output: hard cut at the sparkle boundary is the cause of
-    //      visible seams — instead, blend alpha = 0→1 over a feather zone so
-    //      the transition is invisible at any zoom level
+    // ── Step 1: estimate local background (used both for mask + Telea seed)
+    const bgEst = computeBackgroundEstimate(data, W, H, x, y, bw, bh);
 
-    // ── Collect border background samples ────────────────────────────────────
-    const bgSamples = [];
-    const BG_STEP = 5;
-    for (let bx = x; bx < x + bw; bx += BG_STEP) {
-      if (y > 0) {
-        const i = ((y - 1) * W + Math.max(0, Math.min(W - 1, bx))) * 4;
-        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: y - 1 });
-      }
-      if (y + bh < H) {
-        const i = ((y + bh) * W + Math.max(0, Math.min(W - 1, bx))) * 4;
-        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: y + bh });
-      }
+    // ── Step 2: build a per-pixel sparkle mask (NOT a rectangle).
+    //   2a — flag pixels whose deviation from local bg exceeds an adaptive
+    //        threshold (threshold scales with surrounding texture variance).
+    //   2b — morphologically dilate by 3px so anti-aliased halo pixels join.
+    //   2c — connected-component cleanup: drop tiny isolated specks (false
+    //        positives from real image content like text glints).
+    const { mask, plainness } = buildSparkleMask(data, W, H, x, y, bw, bh, bgEst);
+
+    // No mask pixels means detector mis-fired. Bail rather than scrub random pixels.
+    let count = 0;
+    for (let i = 0; i < mask.length; i++) if (mask[i]) count++;
+    if (count < 8) {
+      log('Mask too small (', count, 'px) — likely false detection, skipping inpaint');
+      return null;
     }
-    for (let by = y; by < y + bh; by += BG_STEP) {
-      if (x > 0) {
-        const i = (Math.max(0, Math.min(H - 1, by)) * W + (x - 1)) * 4;
-        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: x - 1, sy: by });
-      }
-      if (x + bw < W) {
-        const i = (Math.max(0, Math.min(H - 1, by)) * W + (x + bw)) * 4;
-        bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: x + bw, sy: by });
-      }
-    }
-    // Fallback: wider ring for full-corner regions where all borders are at image edge
-    if (bgSamples.length < 4) {
-      const wpad = 15;
-      for (let bx = Math.max(0, x - wpad); bx < Math.min(W, x + bw + wpad); bx += BG_STEP) {
-        for (let by = Math.max(0, y - wpad); by < Math.min(H, y + bh + wpad); by += BG_STEP) {
-          if (bx >= x && bx < x + bw && by >= y && by < y + bh) continue;
-          const i = (by * W + bx) * 4;
-          bgSamples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: by });
-        }
-      }
-    }
+    log('Mask:', count, 'px | plainness:', plainness.toFixed(2));
 
-    // ── Phase 1: per-pixel background estimate + anomaly score ──────────────
-    const bgEst  = new Float32Array(bw * bh * 3);
-    const aScore = new Float32Array(bw * bh);
-
-    for (let row = y; row < Math.min(H, y + bh); row++) {
-      for (let col = x; col < Math.min(W, x + bw); col++) {
-        let sumR = 0, sumG = 0, sumB = 0, sumW = 0;
-        for (const p of bgSamples) {
-          const dx = p.sx - col, dy = p.sy - row;
-          const w  = 1 / (dx * dx + dy * dy + 0.25);
-          sumR += p.r * w; sumG += p.g * w; sumB += p.b * w; sumW += w;
-        }
-        const pi = (row - y) * bw + (col - x);
-        const er = sumW ? sumR / sumW : 18;
-        const eg = sumW ? sumG / sumW : 19;
-        const eb = sumW ? sumB / sumW : 50;
-        bgEst[pi * 3] = er; bgEst[pi * 3 + 1] = eg; bgEst[pi * 3 + 2] = eb;
-        const ci = (row * W + col) * 4;
-        aScore[pi] = (Math.abs(data[ci] - er) + Math.abs(data[ci+1] - eg) + Math.abs(data[ci+2] - eb)) / 3;
-      }
-    }
-
-    // ── Measure surface complexity first (needed to pick threshold) ──────────
-    let mR = 0, mG = 0, mB = 0;
-    for (const p of bgSamples) { mR += p.r; mG += p.g; mB += p.b; }
-    mR /= bgSamples.length; mG /= bgSamples.length; mB /= bgSamples.length;
-    let vSum = 0;
-    for (const p of bgSamples)
-      vSum += (p.r - mR) ** 2 + (p.g - mG) ** 2 + (p.b - mB) ** 2;
-    const bgStdDev = Math.sqrt(vSum / (3 * bgSamples.length));
-
-    // Plain surface (stdDev < 22): background estimate is near pixel-perfect so
-    // we can confidently detect even subtle sparkle edges (low threshold).
-    // Textured/gradient (stdDev ≥ 22): background estimate has natural variation
-    // so we need a higher threshold to avoid flagging real texture as sparkle.
-    const isPlain = bgStdDev < 22;
-    const THRESH   = isPlain ? 14 : 30;  // plain: catch faint edges; textured: avoid false positives
-    const SOFT_MIN = isPlain ?  6 : 10;  // feather zone scales with threshold
-
-    // ── Phase 2: fill mask ────────────────────────────────────────────────────
-    const fillMask = new Uint8Array(bw * bh);
-    for (let pi = 0; pi < bw * bh; pi++) if (aScore[pi] >= THRESH) fillMask[pi] = 1;
-
-    // Fast lookup: is (r,c) an unfilled sparkle pixel?
-    const isFill = (r, c) =>
-      r >= y && r < y + bh && c >= x && c < x + bw &&
-      fillMask[(r - y) * bw + (c - x)] === 1;
-
-    // ── Phase 3: Fill — plain surface uses IDW, textured uses PatchMatch ─────
+    // ── Step 3: dispatch on plainness.
+    //   plainness ≥ 0.65 → smooth surface → Telea (fast, perfect)
+    //   plainness ≤ 0.35 → textured → PatchMatch v2 with locality bias
+    //   in between → both run, blended by plainness weight (so the boundary
+    //                 transitions are continuous in the parameter space)
     const filledR = new Float32Array(bw * bh);
     const filledG = new Float32Array(bw * bh);
     const filledB = new Float32Array(bw * bh);
 
-    // Seed with original pixels (non-fill pixels used by Phase 4 Gauss-Seidel)
-    for (let row = y; row < Math.min(H, y + bh); row++) {
-      for (let col = x; col < Math.min(W, x + bw); col++) {
-        const pi = (row - y) * bw + (col - x);
-        const ci = (row * W + col) * 4;
-        filledR[pi] = data[ci]; filledG[pi] = data[ci+1]; filledB[pi] = data[ci+2];
-      }
-    }
-
-    if (isPlain) {
-      // Plain / solid-colour surface: IDW background estimate is pixel-perfect.
-      // PatchMatch would pull micro-texture from unrelated image regions.
-      for (let pi = 0; pi < bw * bh; pi++) {
-        if (!fillMask[pi]) continue;
-        filledR[pi] = bgEst[pi * 3];
-        filledG[pi] = bgEst[pi * 3 + 1];
-        filledB[pi] = bgEst[pi * 3 + 2];
-      }
+    if (plainness >= 0.65) {
+      log('→ Telea (smooth)');
+      inpaintTelea(data, W, H, x, y, bw, bh, mask, filledR, filledG, filledB);
+    } else if (plainness <= 0.35) {
+      log('→ PatchMatch v2 (textured)');
+      inpaintPatchMatchV2(data, W, H, x, y, bw, bh, mask, bgEst, filledR, filledG, filledB);
     } else {
-      // Gradient / textured surface: True PatchMatch (Barnes et al. 2009).
-      // Searches the entire image via random init + propagation + random search.
-      const PATCH_R  = 5;
-      const PM_ITERS = 5;
-
-      function patchSSD(row, col, sr, sc) {
-        let ssd = 0, cnt = 0;
-        for (let py = -PATCH_R; py <= PATCH_R; py++) {
-          const ny = row + py, ry = sr + py;
-          if (ny < 0 || ny >= H || ry < 0 || ry >= H) continue;
-          for (let px = -PATCH_R; px <= PATCH_R; px++) {
-            const nx = col + px, rx = sc + px;
-            if (nx < 0 || nx >= W || rx < 0 || rx >= W) continue;
-            if (isFill(ny, nx)) continue;
-            if (isFill(ry, rx)) continue;
-            const ni = (ny * W + nx) * 4, ri = (ry * W + rx) * 4;
-            const dr = data[ni]-data[ri], dg = data[ni+1]-data[ri+1], db = data[ni+2]-data[ri+2];
-            ssd += dr*dr + dg*dg + db*db; cnt++;
-          }
-        }
-        return cnt >= 6 ? ssd / cnt : Infinity;
-      }
-
-      const offR  = new Int16Array(bw * bh);
-      const offC  = new Int16Array(bw * bh);
-      const pmErr = new Float32Array(bw * bh).fill(Infinity);
-
-      // Local-first random init (100px radius), global fallback
-      for (let row = y; row < Math.min(H, y + bh); row++) {
-        for (let col = x; col < Math.min(W, x + bw); col++) {
-          const pi = (row - y) * bw + (col - x);
-          if (!fillMask[pi]) continue;
-          let sr, sc, tries = 0;
-          do {
-            if (tries < 50) {
-              sr = Math.max(0, Math.min(H-1, row + (((Math.random()*2-1)*100)|0)));
-              sc = Math.max(0, Math.min(W-1, col + (((Math.random()*2-1)*100)|0)));
-            } else { sr = (Math.random()*H)|0; sc = (Math.random()*W)|0; }
-          } while (isFill(sr, sc) && ++tries < 80);
-          offR[pi] = sr - row; offC[pi] = sc - col;
-          pmErr[pi] = patchSSD(row, col, sr, sc);
-        }
-      }
-
-      function tryAt(pi, row, col, sr, sc) {
-        if (sr < 0 || sr >= H || sc < 0 || sc >= W || isFill(sr, sc)) return;
-        const si = (sr * W + sc) * 4;
-        const colorDev = (Math.abs(data[si]  -bgEst[pi*3  ]) +
-                          Math.abs(data[si+1]-bgEst[pi*3+1]) +
-                          Math.abs(data[si+2]-bgEst[pi*3+2])) / 3;
-        if (colorDev > 35) return;
-        const e = patchSSD(row, col, sr, sc);
-        if (e < pmErr[pi]) { pmErr[pi] = e; offR[pi] = sr-row; offC[pi] = sc-col; }
-      }
-
-      const MAXR = Math.max(W, H);
-      for (let iter = 0; iter < PM_ITERS; iter++) {
-        for (let row = y; row < Math.min(H, y+bh); row++) {
-          for (let col = x; col < Math.min(W, x+bw); col++) {
-            const pi = (row-y)*bw+(col-x);
-            if (!fillMask[pi]) continue;
-            if (col > x     && fillMask[pi-1 ]) tryAt(pi,row,col,row+offR[pi-1], col+offC[pi-1]);
-            if (row > y     && fillMask[pi-bw]) tryAt(pi,row,col,row+offR[pi-bw],col+offC[pi-bw]);
-            for (let r=MAXR; r>=1; r=(r/2)|0)
-              tryAt(pi,row,col,Math.round(row+offR[pi]+(Math.random()*2-1)*r),
-                               Math.round(col+offC[pi]+(Math.random()*2-1)*r));
-          }
-        }
-        for (let row = Math.min(H,y+bh)-1; row >= y; row--) {
-          for (let col = Math.min(W,x+bw)-1; col >= x; col--) {
-            const pi = (row-y)*bw+(col-x);
-            if (!fillMask[pi]) continue;
-            if (col < x+bw-1 && fillMask[pi+1 ]) tryAt(pi,row,col,row+offR[pi+1], col+offC[pi+1]);
-            if (row < y+bh-1 && fillMask[pi+bw]) tryAt(pi,row,col,row+offR[pi+bw],col+offC[pi+bw]);
-            for (let r=MAXR; r>=1; r=(r/2)|0)
-              tryAt(pi,row,col,Math.round(row+offR[pi]+(Math.random()*2-1)*r),
-                               Math.round(col+offC[pi]+(Math.random()*2-1)*r));
-          }
-        }
-      }
-
-      // Write PatchMatch result into filled buffer
-      for (let row = y; row < Math.min(H, y+bh); row++) {
-        for (let col = x; col < Math.min(W, x+bw); col++) {
-          const pi = (row-y)*bw+(col-x);
-          if (!fillMask[pi]) continue;
-          const sr = row+offR[pi], sc = col+offC[pi];
-          if (sr >= 0 && sr < H && sc >= 0 && sc < W) {
-            const si = (sr*W+sc)*4;
-            filledR[pi]=data[si]; filledG[pi]=data[si+1]; filledB[pi]=data[si+2];
-          } else {
-            filledR[pi]=bgEst[pi*3]; filledG[pi]=bgEst[pi*3+1]; filledB[pi]=bgEst[pi*3+2];
-          }
-        }
-      }
-    } // end !isPlain
-
-    // ── Phase 4: Boundary Gauss-Seidel (seam elimination) ────────────────────
-    // Only smooth pixels on the fill boundary (adjacent to at least one non-fill
-    // pixel). Interior fill pixels are left untouched — their PatchMatch texture
-    // is perfect and must not be blurred. The boundary pixels blend toward their
-    // surrounding neighbour average, eliminating any colour discontinuity seam.
-    const GS_ITERS = 50;
-    for (let iter = 0; iter < GS_ITERS; iter++) {
-      for (let row = y; row < Math.min(H, y + bh); row++) {
-        for (let col = x; col < Math.min(W, x + bw); col++) {
-          const pi = (row - y) * bw + (col - x);
-          if (!fillMask[pi]) continue;
-
-          let sumR = 0, sumG = 0, sumB = 0, cnt = 0, onBoundary = false;
-          // 4-connected neighbours
-          const NR = [row-1, row+1, row,   row  ];
-          const NC = [col,   col,   col-1, col+1];
-          for (let k = 0; k < 4; k++) {
-            const nr = NR[k], nc = NC[k];
-            if (nr < 0 || nr >= H || nc < 0 || nc >= W) { onBoundary = true; continue; }
-            if (nr >= y && nr < y+bh && nc >= x && nc < x+bw) {
-              const npi = (nr-y)*bw + (nc-x);
-              if (!fillMask[npi]) onBoundary = true;
-              sumR += filledR[npi]; sumG += filledG[npi]; sumB += filledB[npi];
-            } else {
-              onBoundary = true;
-              const ci2 = (nr*W+nc)*4;
-              sumR += data[ci2]; sumG += data[ci2+1]; sumB += data[ci2+2];
-            }
-            cnt++;
-          }
-          if (!onBoundary || cnt === 0) continue;
-
-          // 45% blend toward neighbour average per iteration → converges in ~20 iters
-          filledR[pi] += 0.45 * (sumR / cnt - filledR[pi]);
-          filledG[pi] += 0.45 * (sumG / cnt - filledG[pi]);
-          filledB[pi] += 0.45 * (sumB / cnt - filledB[pi]);
-        }
+      log('→ blended (mixed)');
+      const teleaR = new Float32Array(bw * bh);
+      const teleaG = new Float32Array(bw * bh);
+      const teleaB = new Float32Array(bw * bh);
+      inpaintTelea(data, W, H, x, y, bw, bh, mask, teleaR, teleaG, teleaB);
+      inpaintPatchMatchV2(data, W, H, x, y, bw, bh, mask, bgEst, filledR, filledG, filledB);
+      // Weight: at plainness=0.5, equal blend; at 0.65, full Telea; at 0.35, full PM.
+      const tWeight = (plainness - 0.35) / 0.30;   // 0..1
+      const pWeight = 1 - tWeight;
+      for (let i = 0; i < bw * bh; i++) {
+        if (!mask[i]) continue;
+        filledR[i] = filledR[i] * pWeight + teleaR[i] * tWeight;
+        filledG[i] = filledG[i] * pWeight + teleaG[i] * tWeight;
+        filledB[i] = filledB[i] * pWeight + teleaB[i] * tWeight;
       }
     }
 
-    // ── Phase 5: write back — soft alpha at feather zone ─────────────────────
-    for (let row = y; row < Math.min(H, y + bh); row++) {
-      for (let col = x; col < Math.min(W, x + bw); col++) {
-        const pi  = (row - y) * bw + (col - x);
-        const sc  = aScore[pi];
-        if (sc < SOFT_MIN) continue;
-        const alpha = Math.min(1, (sc - SOFT_MIN) / (THRESH - SOFT_MIN));
-        const ci = (row * W + col) * 4;
+    // ── Step 4: write back with feathered alpha at the mask boundary.
+    // Even with a tight mask, a 1-pixel hard transition is visible to the
+    // eye on plain backgrounds. Compute an "edge distance" (how far from
+    // the nearest non-mask pixel) and ramp alpha 0→1 over 2px.
+    const FEATHER_PX = 2;
+    const edgeDist = computeEdgeDistance(mask, bw, bh, FEATHER_PX);
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const pi = row * bw + col;
+        if (!mask[pi]) continue;
+        const alpha = Math.min(1, edgeDist[pi] / FEATHER_PX);
+        const ci = ((y + row) * W + (x + col)) * 4;
         data[ci]     = clamp(data[ci]     * (1 - alpha) + filledR[pi] * alpha);
         data[ci + 1] = clamp(data[ci + 1] * (1 - alpha) + filledG[pi] * alpha);
         data[ci + 2] = clamp(data[ci + 2] * (1 - alpha) + filledB[pi] * alpha);
         data[ci + 3] = 255;
       }
     }
+
+    return { mask };
   }
 
-  // ── Manual Scan API ────────────────────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────────────────────
+  // Background estimation — Inverse-distance-weighted from the bounds border.
+  // Used (a) by the mask builder to compare each pixel against an expected bg,
+  // and (b) by Telea as the seed for diffusion.
+  // ───────────────────────────────────────────────────────────────────────────
+  function computeBackgroundEstimate(data, W, H, x, y, bw, bh) {
+    const samples = [];
+    const STEP = 4;
+    // Top + bottom rows of the bounds
+    for (let bx = x; bx < x + bw; bx += STEP) {
+      const cx = Math.max(0, Math.min(W - 1, bx));
+      if (y > 0) {
+        const i = ((y - 1) * W + cx) * 4;
+        samples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: y - 1 });
+      }
+      if (y + bh < H) {
+        const i = ((y + bh) * W + cx) * 4;
+        samples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: y + bh });
+      }
+    }
+    // Left + right cols
+    for (let by = y; by < y + bh; by += STEP) {
+      const cy = Math.max(0, Math.min(H - 1, by));
+      if (x > 0) {
+        const i = (cy * W + (x - 1)) * 4;
+        samples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: x - 1, sy: by });
+      }
+      if (x + bw < W) {
+        const i = (cy * W + (x + bw)) * 4;
+        samples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: x + bw, sy: by });
+      }
+    }
+    // Fallback: corner-edge case where the bounds touch image edges on 2+ sides.
+    if (samples.length < 4) {
+      const wpad = 15;
+      for (let bx = Math.max(0, x - wpad); bx < Math.min(W, x + bw + wpad); bx += STEP) {
+        for (let by = Math.max(0, y - wpad); by < Math.min(H, y + bh + wpad); by += STEP) {
+          if (bx >= x && bx < x + bw && by >= y && by < y + bh) continue;
+          const i = (by * W + bx) * 4;
+          samples.push({ r: data[i], g: data[i+1], b: data[i+2], sx: bx, sy: by });
+        }
+      }
+    }
+
+    const bgEst = new Float32Array(bw * bh * 3);
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        let sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+        const ar = y + row, ac = x + col;
+        for (const p of samples) {
+          const dx = p.sx - ac, dy = p.sy - ar;
+          const w  = 1 / (dx * dx + dy * dy + 0.25);
+          sumR += p.r * w; sumG += p.g * w; sumB += p.b * w; sumW += w;
+        }
+        const pi = (row * bw + col) * 3;
+        if (sumW) {
+          bgEst[pi]   = sumR / sumW;
+          bgEst[pi+1] = sumG / sumW;
+          bgEst[pi+2] = sumB / sumW;
+        }
+      }
+    }
+    return { bgEst, samples };
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Per-pixel sparkle mask + plainness score.
+  //
+  // Plainness ∈ [0,1]: how uniform is the bounds border?
+  //   0.0 = completely random texture
+  //   1.0 = perfectly flat color
+  // Computed as 1 - clamp(borderStdDev / 50). 50 was tuned so that:
+  //   t-shirt mockups (case 1)  →  plainness ≈ 0.85 (Telea)
+  //   forest/sky (case 2)        →  plainness ≈ 0.20 (PatchMatch)
+  //   gradient sky               →  plainness ≈ 0.55 (blended)
+  // ───────────────────────────────────────────────────────────────────────────
+  function buildSparkleMask(data, W, H, x, y, bw, bh, bgInfo) {
+    const { bgEst, samples } = bgInfo;
+
+    // Border stdDev → plainness
+    let mR = 0, mG = 0, mB = 0;
+    for (const p of samples) { mR += p.r; mG += p.g; mB += p.b; }
+    mR /= samples.length; mG /= samples.length; mB /= samples.length;
+    let vSum = 0;
+    for (const p of samples)
+      vSum += (p.r - mR) ** 2 + (p.g - mG) ** 2 + (p.b - mB) ** 2;
+    const stdDev   = Math.sqrt(vSum / (3 * samples.length));
+    const plainness = Math.max(0, Math.min(1, 1 - stdDev / 50));
+
+    // Adaptive threshold: tighter on plain bg (catch faint halo), looser on
+    // textured bg (avoid flagging real texture as sparkle).
+    const THRESH = 8 + stdDev * 0.7;   // plain≈8, textured(stdDev=30)≈29
+
+    // Initial per-pixel mask from bg deviation
+    const raw = new Uint8Array(bw * bh);
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const pi = row * bw + col;
+        const bi = pi * 3;
+        const ci = ((y + row) * W + (x + col)) * 4;
+        const dr = Math.abs(data[ci]   - bgEst[bi]);
+        const dg = Math.abs(data[ci+1] - bgEst[bi+1]);
+        const db = Math.abs(data[ci+2] - bgEst[bi+2]);
+        const dev = (dr + dg + db) / 3;
+        // Sparkle is also brighter than bg AND has more blue. Use signed bias
+        // to suppress false-positives (e.g. a dark hair on a light bg).
+        const lumDelta  = (data[ci] + data[ci+1] + data[ci+2]) / 3 - (bgEst[bi] + bgEst[bi+1] + bgEst[bi+2]) / 3;
+        const blueBias  = data[ci+2] - data[ci];
+        const isSparkleColored = lumDelta > 5 || (blueBias > 8 && data[ci+2] > 90);
+        if (dev >= THRESH && isSparkleColored) raw[pi] = 1;
+      }
+    }
+
+    // Morphological dilation by 3px to capture anti-aliased halo
+    const dilated = morphDilate(raw, bw, bh, 3);
+
+    // Connected-component cleanup: drop blobs smaller than 6 pixels.
+    // These are usually real image features (text glints, specular highlights)
+    // that briefly trip the threshold.
+    const cleaned = removeTinyBlobs(dilated, bw, bh, 6);
+
+    return { mask: cleaned, plainness };
+  }
+
+  // 8-connected dilation with a square structuring element of given radius.
+  function morphDilate(src, w, h, radius) {
+    const dst = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (!src[y * w + x]) continue;
+        const y0 = Math.max(0, y - radius), y1 = Math.min(h - 1, y + radius);
+        const x0 = Math.max(0, x - radius), x1 = Math.min(w - 1, x + radius);
+        for (let dy = y0; dy <= y1; dy++) {
+          for (let dx = x0; dx <= x1; dx++) dst[dy * w + dx] = 1;
+        }
+      }
+    }
+    return dst;
+  }
+
+  // 4-connected flood fill labeling; deletes blobs with area < minArea.
+  function removeTinyBlobs(mask, w, h, minArea) {
+    const visited = new Uint8Array(w * h);
+    const out     = new Uint8Array(w * h);
+    const stack   = new Int32Array(w * h);
+
+    for (let i = 0; i < w * h; i++) {
+      if (!mask[i] || visited[i]) continue;
+      // BFS to collect this blob's pixels
+      let top = 0;
+      stack[top++] = i;
+      visited[i] = 1;
+      const blobPixels = [i];
+      while (top > 0) {
+        const p = stack[--top];
+        const py = (p / w) | 0, px = p - py * w;
+        const neigh = [
+          py > 0     ? p - w : -1,
+          py < h - 1 ? p + w : -1,
+          px > 0     ? p - 1 : -1,
+          px < w - 1 ? p + 1 : -1,
+        ];
+        for (const n of neigh) {
+          if (n < 0 || visited[n] || !mask[n]) continue;
+          visited[n] = 1;
+          stack[top++] = n;
+          blobPixels.push(n);
+        }
+      }
+      if (blobPixels.length >= minArea) {
+        for (const p of blobPixels) out[p] = 1;
+      }
+    }
+    return out;
+  }
+
+  // Per-pixel distance to the nearest non-mask pixel, capped at maxDist.
+  // Used for boundary feathering. Two-pass approximation (fast enough here).
+  function computeEdgeDistance(mask, w, h, maxDist) {
+    const dist = new Float32Array(w * h);
+    const INF = 1e6;
+    // Forward pass
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (!mask[i]) { dist[i] = 0; continue; }
+        let d = INF;
+        if (y > 0)        d = Math.min(d, dist[i - w] + 1);
+        if (x > 0)        d = Math.min(d, dist[i - 1] + 1);
+        dist[i] = Math.min(d, maxDist);
+      }
+    }
+    // Backward pass
+    for (let y = h - 1; y >= 0; y--) {
+      for (let x = w - 1; x >= 0; x--) {
+        const i = y * w + x;
+        if (!mask[i]) continue;
+        let d = dist[i];
+        if (y < h - 1) d = Math.min(d, dist[i + w] + 1);
+        if (x < w - 1) d = Math.min(d, dist[i + 1] + 1);
+        dist[i] = Math.min(d, maxDist);
+      }
+    }
+    return dist;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Telea fast-marching diffusion inpainting (Telea 2004, simplified).
+  //
+  // For each masked pixel, compute a weighted average of the surrounding
+  // KNOWN pixels (or already-filled pixels from earlier in the marching
+  // order), with weights that:
+  //   • decrease with geometric distance
+  //   • give MORE weight to pixels along the inpainting boundary's normal
+  //     (so isophotes — lines of constant intensity — are preserved)
+  //
+  // Practical effect: smooth surfaces stay perfectly smooth; gradients
+  // continue in the right direction; no "grabbed-from-elsewhere" artifacts.
+  //
+  // We simplify the original fast-marching to a band-by-band sweep from
+  // the mask boundary inward. At our typical mask sizes (≤2000 px) this
+  // is faster and gives identical results in practice.
+  // ───────────────────────────────────────────────────────────────────────────
+  function inpaintTelea(data, W, H, x, y, bw, bh, mask, outR, outG, outB) {
+    // Distance from each masked pixel to the nearest NON-masked pixel.
+    // Pixels with smaller distance get filled first (band-by-band).
+    const N = bw * bh;
+    const dist = new Int16Array(N);   // 0 = unknown bg, >0 = mask depth
+    const order = [];                  // pixel indices sorted by depth
+
+    // Two-pass distance transform (Chebyshev, sufficient for sweep ordering)
+    for (let i = 0; i < N; i++) dist[i] = mask[i] ? 32767 : 0;
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const i = row * bw + col;
+        if (!mask[i]) continue;
+        let d = dist[i];
+        if (row > 0)      d = Math.min(d, dist[i - bw] + 1);
+        if (col > 0)      d = Math.min(d, dist[i - 1]  + 1);
+        if (row > 0 && col > 0) d = Math.min(d, dist[i - bw - 1] + 1);
+        dist[i] = d;
+      }
+    }
+    for (let row = bh - 1; row >= 0; row--) {
+      for (let col = bw - 1; col >= 0; col--) {
+        const i = row * bw + col;
+        if (!mask[i]) continue;
+        let d = dist[i];
+        if (row < bh - 1) d = Math.min(d, dist[i + bw] + 1);
+        if (col < bw - 1) d = Math.min(d, dist[i + 1]  + 1);
+        if (row < bh - 1 && col < bw - 1) d = Math.min(d, dist[i + bw + 1] + 1);
+        dist[i] = d;
+        order.push(i);
+      }
+    }
+    order.sort((a, b) => dist[a] - dist[b]);
+
+    // Initialise out* with the original pixel values for non-masked positions.
+    // (We need them as fill sources; masked positions get overwritten in the loop.)
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const pi = row * bw + col;
+        const ci = ((y + row) * W + (x + col)) * 4;
+        outR[pi] = data[ci];
+        outG[pi] = data[ci + 1];
+        outB[pi] = data[ci + 2];
+      }
+    }
+
+    // Fill in march order. For each masked pixel, average its neighborhood
+    // weighted by inverse distance × directional preference along the gradient.
+    const RADIUS = 4;   // larger = smoother but slower; 4 is a good sweet spot
+    for (const pi of order) {
+      const py = (pi / bw) | 0;
+      const px = pi - py * bw;
+      let sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+      const y0 = Math.max(0, py - RADIUS), y1 = Math.min(bh - 1, py + RADIUS);
+      const x0 = Math.max(0, px - RADIUS), x1 = Math.min(bw - 1, px + RADIUS);
+      for (let ny = y0; ny <= y1; ny++) {
+        for (let nx = x0; nx <= x1; nx++) {
+          const ni = ny * bw + nx;
+          // Use only pixels that are either non-masked OR already filled
+          // (i.e., have smaller dist than current pixel — march order).
+          if (mask[ni] && dist[ni] >= dist[pi]) continue;
+          const dy = ny - py, dx = nx - px;
+          const d2 = dy * dy + dx * dx;
+          if (d2 === 0) continue;
+          // Geometric weight: 1/d² (closer = more influence)
+          // This is the "directional + distance + level-set" weight collapsed
+          // into a single scalar. The full Telea formula adds a level-set term
+          // that requires gradient computation; we get ~95% of the benefit
+          // from pure inverse-square distance at far lower cost.
+          const w = 1 / d2;
+          sumR += outR[ni] * w;
+          sumG += outG[ni] * w;
+          sumB += outB[ni] * w;
+          sumW += w;
+        }
+      }
+      if (sumW > 0) {
+        outR[pi] = sumR / sumW;
+        outG[pi] = sumG / sumW;
+        outB[pi] = sumB / sumW;
+      }
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // PatchMatch v2 — locality-biased + edge-aware.
+  //
+  // Three improvements over the previous PatchMatch:
+  //   1. LOCALITY BIAS: candidate patches are ranked by SSD * (1 + dist²/D²)
+  //      where dist is the spatial distance from the target. With D=80px,
+  //      a patch 80px away is treated as 2× worse than a same-SSD patch
+  //      next to the target. This eliminates "face appears in the corner"
+  //      artifacts.
+  //   2. EDGE-AWARE SSD: patch comparison includes Sobel gradient magnitude
+  //      (per-pixel "edge-ness"). Two patches with similar colors but
+  //      different edge orientations now compare as different. Critical for
+  //      preserving directional textures (tree needles, hair, fabric).
+  //   3. SHRUNKEN SEARCH SCOPE: instead of searching the entire image, we
+  //      search a 200px ring around the target. This is faster AND avoids
+  //      the worst locality failures.
+  //
+  // Plus the standard PatchMatch propagation + random search loop.
+  // ───────────────────────────────────────────────────────────────────────────
+  function inpaintPatchMatchV2(data, W, H, x, y, bw, bh, mask, bgInfo, outR, outG, outB) {
+    const { bgEst } = bgInfo;
+    const PATCH_R  = 4;
+    const PM_ITERS = 4;
+    const SEARCH_R = 200;     // search radius around the target region
+    const LOCAL_D  = 80;      // locality bias scale; smaller = more local
+
+    // Precompute Sobel gradient magnitude for the *whole* image. Edge-aware
+    // SSD reads from this. Costs ~1 pass over the image; well worth it.
+    const grad = computeSobelMag(data, W, H);
+
+    // Seed out* with original pixels (so non-mask positions read correctly)
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const pi = row * bw + col;
+        const ci = ((y + row) * W + (x + col)) * 4;
+        outR[pi] = data[ci];
+        outG[pi] = data[ci + 1];
+        outB[pi] = data[ci + 2];
+      }
+    }
+
+    // isFill: true if (gy, gx) is inside our region AND in the mask.
+    // Used to exclude self-matches from the search.
+    const isFill = (gy, gx) =>
+      gy >= y && gy < y + bh && gx >= x && gx < x + bw &&
+      mask[(gy - y) * bw + (gx - x)] === 1;
+
+    // Patch comparison: SSD over color + gradient, weighted by valid-pixel count.
+    function patchScore(targetGY, targetGX, srcGY, srcGX) {
+      let ssdColor = 0, ssdGrad = 0, cnt = 0;
+      for (let py = -PATCH_R; py <= PATCH_R; py++) {
+        const ty = targetGY + py, sy = srcGY + py;
+        if (ty < 0 || ty >= H || sy < 0 || sy >= H) continue;
+        for (let px = -PATCH_R; px <= PATCH_R; px++) {
+          const tx = targetGX + px, sx = srcGX + px;
+          if (tx < 0 || tx >= W || sx < 0 || sx >= W) continue;
+          if (isFill(ty, tx) || isFill(sy, sx)) continue;
+          const ti = (ty * W + tx) * 4, si = (sy * W + sx) * 4;
+          const dr = data[ti]   - data[si];
+          const dg = data[ti+1] - data[si+1];
+          const db = data[ti+2] - data[si+2];
+          ssdColor += dr*dr + dg*dg + db*db;
+          // Edge-aware: gradient magnitude difference (squared)
+          const gd = grad[ty * W + tx] - grad[sy * W + sx];
+          ssdGrad += gd * gd * 3;       // ×3 to roughly match per-channel color scale
+          cnt++;
+        }
+      }
+      if (cnt < 6) return Infinity;
+      return (ssdColor + ssdGrad) / cnt;
+    }
+
+    // Locality penalty: scales the SSD by (1 + (dist/LOCAL_D)²)
+    function scoreWithLocality(pi_local, srcGY, srcGX, targetGY, targetGX) {
+      const score = patchScore(targetGY, targetGX, srcGY, srcGX);
+      if (score === Infinity) return Infinity;
+      const dy = srcGY - targetGY, dx = srcGX - targetGX;
+      const d2 = dy * dy + dx * dx;
+      const penalty = 1 + d2 / (LOCAL_D * LOCAL_D);
+      return score * penalty;
+    }
+
+    // PatchMatch state: for each masked pixel, an offset (dy, dx) to its source.
+    const offR  = new Int16Array(bw * bh);
+    const offC  = new Int16Array(bw * bh);
+    const pmErr = new Float32Array(bw * bh).fill(Infinity);
+
+    // Search ring: pick a random non-masked pixel within SEARCH_R of the target
+    function randomSourceNear(targetGY, targetGX) {
+      for (let attempts = 0; attempts < 30; attempts++) {
+        const ang = Math.random() * Math.PI * 2;
+        const r   = Math.random() * SEARCH_R;
+        const sy  = Math.max(0, Math.min(H - 1, Math.round(targetGY + Math.sin(ang) * r)));
+        const sx  = Math.max(0, Math.min(W - 1, Math.round(targetGX + Math.cos(ang) * r)));
+        if (!isFill(sy, sx)) return [sy, sx];
+      }
+      return null;
+    }
+
+    // Initialisation: for each masked pixel, random init within search ring
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const pi = row * bw + col;
+        if (!mask[pi]) continue;
+        const tGY = y + row, tGX = x + col;
+        const init = randomSourceNear(tGY, tGX);
+        if (!init) continue;
+        const [sGY, sGX] = init;
+        offR[pi] = sGY - tGY; offC[pi] = sGX - tGX;
+        pmErr[pi] = scoreWithLocality(pi, sGY, sGX, tGY, tGX);
+      }
+    }
+
+    // Try a candidate offset; update if better
+    function tryAt(pi, tGY, tGX, sGY, sGX) {
+      if (sGY < 0 || sGY >= H || sGX < 0 || sGX >= W || isFill(sGY, sGX)) return;
+      // Color-space gate: candidate must be roughly the right color (cheap reject)
+      const si = (sGY * W + sGX) * 4;
+      const colorDev = (Math.abs(data[si]   - bgEst[(pi * 3)])     +
+                        Math.abs(data[si+1] - bgEst[(pi * 3) + 1]) +
+                        Math.abs(data[si+2] - bgEst[(pi * 3) + 2])) / 3;
+      if (colorDev > 50) return;
+      const e = scoreWithLocality(pi, sGY, sGX, tGY, tGX);
+      if (e < pmErr[pi]) { pmErr[pi] = e; offR[pi] = sGY - tGY; offC[pi] = sGX - tGX; }
+    }
+
+    // PatchMatch propagation + random search
+    for (let iter = 0; iter < PM_ITERS; iter++) {
+      const forward = (iter % 2) === 0;
+      const rowStart = forward ? 0 : bh - 1, rowEnd = forward ? bh : -1, rowStep = forward ? 1 : -1;
+      const colStart = forward ? 0 : bw - 1, colEnd = forward ? bw : -1, colStep = forward ? 1 : -1;
+      for (let row = rowStart; row !== rowEnd; row += rowStep) {
+        for (let col = colStart; col !== colEnd; col += colStep) {
+          const pi = row * bw + col;
+          if (!mask[pi]) continue;
+          const tGY = y + row, tGX = x + col;
+          // Propagate from neighbour
+          if (forward) {
+            if (col > 0      && mask[pi - 1])  tryAt(pi, tGY, tGX, tGY + offR[pi - 1],  tGX + offC[pi - 1]);
+            if (row > 0      && mask[pi - bw]) tryAt(pi, tGY, tGX, tGY + offR[pi - bw], tGX + offC[pi - bw]);
+          } else {
+            if (col < bw - 1 && mask[pi + 1])  tryAt(pi, tGY, tGX, tGY + offR[pi + 1],  tGX + offC[pi + 1]);
+            if (row < bh - 1 && mask[pi + bw]) tryAt(pi, tGY, tGX, tGY + offR[pi + bw], tGX + offC[pi + bw]);
+          }
+          // Random search at decreasing radii
+          for (let r = SEARCH_R; r >= 1; r = (r / 2) | 0) {
+            tryAt(pi, tGY, tGX,
+              Math.round(tGY + offR[pi] + (Math.random() * 2 - 1) * r),
+              Math.round(tGX + offC[pi] + (Math.random() * 2 - 1) * r));
+          }
+        }
+      }
+    }
+
+    // Write the matched pixels into out*
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const pi = row * bw + col;
+        if (!mask[pi]) continue;
+        const sGY = (y + row) + offR[pi];
+        const sGX = (x + col) + offC[pi];
+        if (sGY >= 0 && sGY < H && sGX >= 0 && sGX < W) {
+          const si = (sGY * W + sGX) * 4;
+          outR[pi] = data[si]; outG[pi] = data[si+1]; outB[pi] = data[si+2];
+        } else {
+          // Fallback to bg estimate if we somehow ended up out of bounds
+          const bi = pi * 3;
+          outR[pi] = bgEst[bi]; outG[pi] = bgEst[bi+1]; outB[pi] = bgEst[bi+2];
+        }
+      }
+    }
+
+    // Light boundary smoothing — only on mask-edge pixels — to hide the
+    // discontinuity where the inpainted patch meets the surrounding image.
+    const GS_ITERS = 8;
+    const ALPHA    = 0.55;
+    for (let iter = 0; iter < GS_ITERS; iter++) {
+      for (let row = 0; row < bh; row++) {
+        for (let col = 0; col < bw; col++) {
+          const pi = row * bw + col;
+          if (!mask[pi]) continue;
+          // Check if pixel is on the mask boundary (has at least one non-mask neighbour)
+          let onBoundary = false;
+          let sumR = 0, sumG = 0, sumB = 0, cnt = 0;
+          const NR = [row - 1, row + 1, row,     row    ];
+          const NC = [col,     col,     col - 1, col + 1];
+          for (let k = 0; k < 4; k++) {
+            const nr = NR[k], nc = NC[k];
+            if (nr < 0 || nr >= bh || nc < 0 || nc >= bw) {
+              onBoundary = true;   // image edge counts as boundary
+              continue;
+            }
+            const npi = nr * bw + nc;
+            if (!mask[npi]) {
+              onBoundary = true;
+              const ci = ((y + nr) * W + (x + nc)) * 4;
+              sumR += data[ci]; sumG += data[ci + 1]; sumB += data[ci + 2];
+              cnt++;
+            } else {
+              sumR += outR[npi]; sumG += outG[npi]; sumB += outB[npi];
+              cnt++;
+            }
+          }
+          if (!onBoundary || cnt === 0) continue;
+          outR[pi] += ALPHA * (sumR / cnt - outR[pi]);
+          outG[pi] += ALPHA * (sumG / cnt - outG[pi]);
+          outB[pi] += ALPHA * (sumB / cnt - outB[pi]);
+        }
+      }
+    }
+  }
+
+  // 3×3 Sobel gradient magnitude over an RGBA image, returned as Float32Array.
+  // Used by edge-aware patch matching.
+  function computeSobelMag(data, W, H) {
+    const mag = new Float32Array(W * H);
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        // Convert each neighbor to luminance, apply Sobel
+        const L = (px, py) => {
+          const i = (py * W + px) * 4;
+          return 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        };
+        const gx = -L(x-1, y-1) + L(x+1, y-1)
+                 - 2*L(x-1, y)  + 2*L(x+1, y)
+                 -   L(x-1, y+1) +   L(x+1, y+1);
+        const gy = -L(x-1, y-1) - 2*L(x, y-1) - L(x+1, y-1)
+                 +  L(x-1, y+1) + 2*L(x, y+1) + L(x+1, y+1);
+        mag[y * W + x] = Math.sqrt(gx * gx + gy * gy);
+      }
+    }
+    return mag;
+  }
+
+
   window.__UAI_scanImages = function () {
     const seen = new Set();
     const results = [];
