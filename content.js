@@ -37,6 +37,10 @@
 
   const TAG = '[UAI-iso]';
 
+  // Set to true during development to see internal logs in the page console.
+  // MUST be false for any version uploaded to the Chrome Web Store.
+  const DEBUG = false;
+
   // ── Settings ───────────────────────────────────────────────────────────────
   // Only these three are user-controllable. Output format is always PNG, visible
   // watermark + SynthID removal are always on, notifications are always on.
@@ -2219,6 +2223,7 @@
   }
 
   function log(...args) {
+    if (!DEBUG) return;
     console.log('%c' + TAG, 'color:#38bdf8;font-weight:700', ...args);
   }
 

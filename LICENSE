@@ -1,0 +1,176 @@
+UnmarkAI License
+================
+
+Copyright (c) 2026 [YOUR NAME OR COMPANY]. All rights reserved.
+
+This software ("UnmarkAI") and its accompanying source code, documentation,
+icons, and other materials (collectively, the "Software") are made available
+under the terms below. Reading, downloading, installing, or using the Software
+constitutes acceptance of these terms.
+
+1. PERMITTED USE
+----------------
+You may, free of charge:
+
+  (a) Install and use the Software for your own personal, non-commercial
+      purposes on devices you own or control.
+
+  (b) View, study, and inspect the source code for personal educational
+      purposes and to verify the Software's behaviour (including its privacy
+      and security claims).
+
+  (c) Report bugs, suggest features, and submit feedback to the copyright
+      holder via the project's official issue tracker or contact channels.
+
+  (d) Make a personal backup copy of the Software for your own use.
+
+2. PROHIBITED USE
+-----------------
+You may NOT, without the prior written permission of the copyright holder:
+
+  (a) Sell, sublicense, lease, rent, or otherwise commercially distribute
+      the Software, in whole or in part, in original or modified form.
+
+  (b) Distribute, republish, mirror, or upload the Software (in whole or in
+      modified form) to any application store, marketplace, software
+      repository, or other public or private distribution channel. The
+      official Chrome Web Store listing operated by the copyright holder is
+      the sole authorised distribution channel for general public use.
+
+  (c) Create derivative works from the Software for any commercial purpose,
+      including products that compete with or substantially replicate the
+      functionality of the Software or any future paid version of it.
+
+  (d) Use the Software, its source code, or any portion thereof to train
+      machine learning models, build datasets, or develop competing software.
+
+  (e) Remove, obscure, or alter any copyright notices, license terms,
+      attribution, branding, or trademarks contained in the Software.
+
+  (f) Use the name "UnmarkAI", any associated logos or marks, or confusingly
+      similar names or marks for any purpose other than referring to the
+      Software itself in factual context.
+
+3. RESERVED COMMERCIAL RIGHTS
+-----------------------------
+The copyright holder reserves all commercial rights in and to the Software,
+including but not limited to:
+
+  (a) The right to develop, market, and sell paid versions, premium tiers,
+      subscriptions, or feature add-ons (including but not limited to a
+      future "Pro" version of UnmarkAI).
+
+  (b) The right to license the Software or portions of it to third parties
+      under separate commercial terms.
+
+  (c) The right to integrate the Software or portions of it into other
+      products, services, or platforms operated by the copyright holder
+      or its commercial partners.
+
+Nothing in this license shall be construed as granting you any commercial
+rights, whether express or implied, by estoppel or otherwise.
+
+4. CONTRIBUTIONS
+----------------
+If you submit any code, suggestions, bug reports, or other contributions
+to the Software (collectively, "Contributions"), you grant the copyright
+holder a perpetual, worldwide, non-exclusive, royalty-free, irrevocable
+licence to use, modify, sublicense, and distribute such Contributions
+under any licence terms (including commercial terms) without obligation
+to you. You represent that you have the legal right to grant this licence.
+
+5. NO WARRANTY
+--------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, NONINFRINGEMENT, OR ACCURACY OF RESULTS.
+
+The Software performs image processing using algorithmic and machine-learning
+techniques whose output is inherently probabilistic and approximate. The
+copyright holder makes NO representation or warranty:
+
+  (a) that the Software will detect or remove every watermark in every image;
+  (b) that processed images will be free of artifacts or visual defects;
+  (c) that the Software's SynthID-disruption pass will defeat any specific
+      detection system, present or future, operated by Google or any other
+      party;
+  (d) that the Software is suitable for use in any application where the
+      consequences of imperfect output (legal, commercial, or otherwise)
+      could be material.
+
+You assume all risk arising from your use of the Software's output.
+
+6. LIMITATION OF LIABILITY
+--------------------------
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR ANY CONTRIBUTOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING BUT
+NOT LIMITED TO PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+7. ACCEPTABLE USE
+-----------------
+You agree not to use the Software:
+
+  (a) to violate any applicable law, regulation, or third-party right;
+  (b) to remove watermarks from images you do not own or have explicit
+      permission to modify;
+  (c) to evade content authenticity, attribution, or provenance systems
+      where doing so would mislead, defraud, or harm another party;
+  (d) to facilitate misinformation, deep-fakes intended to deceive, or
+      content that infringes the rights of any person.
+
+The copyright holder reserves the right to terminate your licence
+immediately if you breach this section.
+
+8. TERMINATION
+--------------
+This licence is effective until terminated. Your rights under this licence
+will terminate automatically and without notice if you fail to comply with
+any of its terms. Upon termination, you must cease all use of the Software
+and destroy all copies in your possession.
+
+The copyright holder may update or modify this licence for future versions
+of the Software. Continued use of the Software after such modifications
+constitutes acceptance of the updated terms.
+
+9. THIRD-PARTY COMPONENTS
+-------------------------
+The Software incorporates the following third-party components, each
+governed by its own licence:
+
+  - ONNX Runtime Web (Microsoft)        — MIT License
+  - LaMa inpainting model (saic-mdal)   — Apache 2.0 / Creative Commons
+                                          (see model card for the specific
+                                          model file distributed)
+
+Use of these components in the Software does not affect the licensing of
+the Software as a whole, which remains governed by this licence.
+
+10. GOVERNING LAW
+-----------------
+This licence shall be governed by and construed in accordance with the
+laws of [YOUR JURISDICTION], without regard to its conflict-of-laws
+principles. Any dispute arising under or in connection with this licence
+shall be subject to the exclusive jurisdiction of the courts of
+[YOUR JURISDICTION].
+
+11. ENTIRE AGREEMENT
+--------------------
+This licence constitutes the entire agreement between you and the
+copyright holder regarding the Software and supersedes all prior or
+contemporaneous understandings, whether written or oral.
+
+If any provision of this licence is held to be unenforceable, the
+remaining provisions shall continue in full force and effect.
+
+────────────────────────────────────────────────────────────────────────
+
+For commercial licensing inquiries, partnership opportunities, or
+permission to use the Software outside the scope of this licence,
+contact: [YOUR EMAIL OR CONTACT URL]
+
+End of License.

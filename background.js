@@ -12,6 +12,13 @@
  */
 'use strict';
 
+// Set to true during development to see internal logs in the SW console.
+// MUST be false for any version uploaded to the Chrome Web Store.
+const DEBUG = false;
+const log   = DEBUG ? console.log.bind(console, '[UAI bg]')   : () => {};
+const warn  = DEBUG ? console.warn.bind(console, '[UAI bg]')  : () => {};
+const error = console.error.bind(console, '[UAI bg]');  // errors always shown
+
 // ── Offscreen document lifecycle ─────────────────────────────────────────────
 const OFFSCREEN_URL = 'offscreen.html';
 let creatingOffscreen = null;
@@ -218,7 +225,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     target: { tabId: tab.id },
     func: (url) => window.__UAI_processAndDownload?.(url, 'unmark-ai-clean.png'),
     args: [info.srcUrl],
-  }).catch(console.error);
+  }).catch(error);
 });
 
 // ── Download interception (auto-clean Gemini downloads) ──────────────────────
@@ -275,10 +282,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
     }).catch(e => [{ result: { ok: false, error: e.message } }]);
 
     const result = results?.[0]?.result;
-    if (result?.ok === false) console.warn('[UAI bg] fallback failed:', result.error);
+    if (result?.ok === false) warn('fallback failed:', result.error);
     unlockUrl(item.url);
   } catch (e) {
-    console.error('[UAI bg] fallback error:', e.message);
+    error('fallback error:', e.message);
   }
 });
 
@@ -338,7 +345,7 @@ chrome.runtime.onConnect.addListener((port) => {
         port.postMessage({ type: 'result', ok: false, error: result?.error || 'Inference failed' });
       }
     } catch (err) {
-      console.error('[UAI bg] inference forward error:', err.message);
+      error('inference forward error:', err.message);
       try { port.postMessage({ type: 'result', ok: false, error: err.message }); } catch {}
     }
   });
@@ -385,7 +392,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           }
           await refreshModelStateFromOffscreen();
         } catch (e) {
-          console.warn('[UAI bg] getModelStatus refresh failed:', e.message);
+          warn('getModelStatus refresh failed:', e.message);
         }
         sendResponse({
           loaded:   modelLoadState.status === 'ready',
@@ -410,7 +417,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     case 'preWarmModel':
       if (modelLoadState.status === 'idle' || modelLoadState.status === 'error') {
-        offscreenSend('warmup').catch(e => console.warn('[UAI bg] pre-warm failed:', e.message));
+        offscreenSend('warmup').catch(e => warn('pre-warm failed:', e.message));
       }
       sendResponse({ ok: true, status: modelLoadState.status });
       return false;
@@ -510,4 +517,4 @@ function setIconVariant(active) {
   }).catch(() => {});
 }
 
-console.log('[UAI bg] service worker booted');
+log('service worker booted');

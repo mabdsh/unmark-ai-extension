@@ -20,6 +20,13 @@
  */
 'use strict';
 
+// Set to true during development to see internal logs in the offscreen console.
+// MUST be false for any version uploaded to the Chrome Web Store.
+const DEBUG = false;
+const log   = DEBUG ? console.log.bind(console, '[UAI offscreen]')   : () => {};
+const warn  = DEBUG ? console.warn.bind(console, '[UAI offscreen]')  : () => {};
+const error = console.error.bind(console, '[UAI offscreen]');
+
 // ── ORT setup ────────────────────────────────────────────────────────────────
 if (self.ort) {
   const extRoot = chrome.runtime.getURL('');
@@ -33,9 +40,9 @@ if (self.ort) {
   // Disable proxy worker explicitly — single-thread mode shouldn't need one,
   // but some ORT versions still try to spawn one without this hint.
   self.ort.env.wasm.proxy = false;
-  console.log('[UAI offscreen] ORT loaded ✓ — single-thread WASM');
+  log('ORT loaded ✓ — single-thread WASM');
 } else {
-  console.error('[UAI offscreen] ORT failed to load');
+  error('ORT failed to load');
 }
 
 // ── CDN URL ──────────────────────────────────────────────────────────────────
@@ -43,7 +50,7 @@ const MODEL_CDN_URL = 'https://github.com/mabdsh/lama_fp32/releases/download/v1.
 
 // SHA-256 of the expected lama-model.onnx file. Set to '' to disable verification.
 // Compute via:  sha256sum lama-model.onnx
-const MODEL_SHA256 = '';
+const MODEL_SHA256 = '1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6';
 
 async function sha256Hex(buf) {
   const hash = await crypto.subtle.digest('SHA-256', buf);
@@ -108,13 +115,13 @@ function setModelState(patch) {
       state: { ...modelLoadState }
     }).catch(() => {});
   } catch {}
-  console.log('[UAI offscreen] model state:', modelLoadState.status,
+  log('model state:', modelLoadState.status,
     modelLoadState.progress ? modelLoadState.progress + '%' : '');
 }
 
 // ── CDN download with progress ───────────────────────────────────────────────
 async function downloadModelFromCDN() {
-  console.log('[UAI offscreen] Downloading model from CDN:', MODEL_CDN_URL);
+  log('Downloading model from CDN:', MODEL_CDN_URL);
   setModelState({ status: 'downloading', progress: 0, error: null });
 
   // AbortController — user can cancel from popup → bg → us.
@@ -183,7 +190,7 @@ async function downloadModelFromCDN() {
 
   currentDownloadController = null;
   setModelState({ status: 'downloading', progress: 100 });
-  console.log('[UAI offscreen] Download complete —', (received / 1024 / 1024).toFixed(1), 'MB');
+  log('Download complete —', (received / 1024 / 1024).toFixed(1), 'MB');
   return full.buffer;
 }
 
@@ -204,21 +211,21 @@ async function getLamaSession() {
       // 1. Try IDB cache
       let modelBuf = null;
       try {
-        console.log('[UAI offscreen] Checking IndexedDB cache…');
+        log('Checking IndexedDB cache…');
         modelBuf = await idbGet(IDB_KEY);
         if (modelBuf) {
-          console.log('[UAI offscreen] Model found in cache ✓');
+          log('Model found in cache ✓');
           if (MODEL_SHA256) {
             const cachedHash = await sha256Hex(modelBuf);
             if (cachedHash !== MODEL_SHA256) {
-              console.warn('[UAI offscreen] Cached model hash mismatch — re-downloading');
+              warn('Cached model hash mismatch — re-downloading');
               try { await idbDelete(IDB_KEY); } catch {}
               modelBuf = null;
             }
           }
         }
       } catch (e) {
-        console.warn('[UAI offscreen] IDB read failed, will re-download:', e.message);
+        warn('IDB read failed, will re-download:', e.message);
       }
 
       // 2. Download from CDN
@@ -231,14 +238,14 @@ async function getLamaSession() {
               `Model integrity check failed. Expected ${MODEL_SHA256.slice(0,16)}…, got ${actualHash.slice(0,16)}…`
             );
           }
-          console.log('[UAI offscreen] Model integrity verified ✓');
+          log('Model integrity verified ✓');
         }
         try {
           setModelState({ status: 'loading', progress: 100 });
-          console.log('[UAI offscreen] Saving model to IDB cache…');
+          log('Saving model to IDB cache…');
           await idbPut(IDB_KEY, modelBuf);
         } catch (e) {
-          console.warn('[UAI offscreen] IDB save failed:', e.message);
+          warn('IDB save failed:', e.message);
         }
       }
 
@@ -248,7 +255,7 @@ async function getLamaSession() {
       // (significantly faster on modern GPUs), bundle that file and switch
       // the providers list to ['webgpu', 'wasm'].
       setModelState({ status: 'loading', progress: 100 });
-      console.log('[UAI offscreen] Creating ORT inference session…');
+      log('Creating ORT inference session…');
 
       lamaSession = await self.ort.InferenceSession.create(modelBuf, {
         executionProviders:     ['wasm'],
@@ -257,7 +264,7 @@ async function getLamaSession() {
       });
 
       setModelState({ status: 'ready', progress: 100, error: null });
-      console.log('[UAI offscreen] session ready ✓ inputs:', lamaSession.inputNames);
+      log('session ready ✓ inputs:', lamaSession.inputNames);
       return lamaSession;
     } catch (err) {
       lamaSession    = null;
@@ -480,13 +487,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     const cached = await idbGet(IDB_KEY);
     if (cached && cached.byteLength > 1_000_000) {
-      console.log('[UAI offscreen] Cached model detected — auto-loading…');
+      log('Cached model detected — auto-loading…');
       setModelState({ status: 'loading', progress: 100, error: null });
       // Hash check (only if MODEL_SHA256 is set)
       if (MODEL_SHA256) {
         const cachedHash = await sha256Hex(cached);
         if (cachedHash !== MODEL_SHA256) {
-          console.warn('[UAI offscreen] Cached model hash mismatch — discarding');
+          warn('Cached model hash mismatch — discarding');
           try { await idbDelete(IDB_KEY); } catch {}
           setModelState({ status: 'idle', progress: 0, error: null });
           return;
@@ -498,7 +505,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         enableCpuMemArena:      true,
       });
       setModelState({ status: 'ready', progress: 100, error: null });
-      console.log('[UAI offscreen] Auto-loaded ✓ inputs:', lamaSession.inputNames);
+      log('Auto-loaded ✓ inputs:', lamaSession.inputNames);
     } else {
       setModelState({ status: 'idle', progress: 0, error: null });
     }
@@ -506,7 +513,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // ORT session creation failed on a cached model. The cache is likely
     // corrupt — drop it so the next warmup triggers a fresh download — and
     // surface the error to the popup so the user sees what happened.
-    console.warn('[UAI offscreen] Auto-load failed, discarding cache:', e.message);
+    warn('Auto-load failed, discarding cache:', e.message);
     try { await idbDelete(IDB_KEY); } catch {}
     lamaSession = null;
     setModelState({
@@ -516,4 +523,4 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
   }
 })();
-console.log('[UAI offscreen] Ready');
+log('Ready');

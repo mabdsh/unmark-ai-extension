@@ -34,6 +34,10 @@
 
   const TAG = '[UAI-main]';
 
+  // Set to true during development to see internal logs in the page console.
+  // MUST be false for any version uploaded to the Chrome Web Store.
+  const DEBUG = false;
+
   // Optimistic defaults — updated by isolated world via GWR_SETTINGS
   let enabled       = true;
   let autoIntercept = true; // when false, all intercept paths pass through
@@ -306,6 +310,7 @@
   }
 
   function log(...args) {
+    if (!DEBUG) return;
     console.log('%c' + TAG, 'color:#2DD4BF;font-weight:700', ...args);
   }
 
